@@ -12,7 +12,10 @@ import { sleep } from '../helpers/promises';
 import { buyFailureShouldStop, errorText, simulationFailure } from './tx-error';
 
 export class DefaultTransactionExecutor implements TransactionExecutor {
-  constructor(private readonly connection: Connection) {}
+  constructor(
+    private readonly connection: Connection,
+    private readonly sendConnection: Connection = connection,
+  ) {}
 
   public async executeAndConfirm(
     transaction: VersionedTransaction,
@@ -37,7 +40,7 @@ export class DefaultTransactionExecutor implements TransactionExecutor {
     }
 
     try {
-      const sent = await this.connection.sendRawTransaction(transaction.serialize(), {
+      const sent = await this.sendConnection.sendRawTransaction(transaction.serialize(), {
         skipPreflight: true,
         maxRetries: 2,
       });

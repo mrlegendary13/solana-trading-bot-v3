@@ -140,6 +140,7 @@ export async function checkTokenQuality(
     supply: bigint;
     excludeAccounts: string[];
     activityAccount?: PublicKey;
+    mintData?: Buffer;
   },
 ): Promise<string | null> {
   if (!config.enabled) {
@@ -169,19 +170,19 @@ export async function checkTokenQuality(
   }
 
   if (config.checkSellable || config.maxSingleHolderPct > 0 || config.maxTop10Pct > 0) {
-    const mintAccount = await connection.getAccountInfo(mint, connection.commitment);
-    if (!mintAccount) {
+    const mintData = options.mintData ?? (await thisMint(connection, mint));
+    if (!mintData) {
       return 'mint account is missing';
     }
     if (config.checkSellable) {
-      const reason = sellabilityReason(Buffer.from(mintAccount.data), config.maxTransferFeeBps);
+      const reason = sellabilityReason(mintData, config.maxTransferFeeBps);
       if (reason) {
         return reason;
       }
     }
     if (config.maxSingleHolderPct > 0 || config.maxTop10Pct > 0) {
       const largest = await connection.getTokenLargestAccounts(mint, connection.commitment);
-      const supply = options.supply > 0n ? options.supply : Buffer.from(mintAccount.data).readBigUInt64LE(36);
+      const supply = options.supply > 0n ? options.supply : mintData.readBigUInt64LE(36);
       const { top, top10 } = holderPercents(
         largest.value.map((row) => ({ address: row.address.toBase58(), amount: BigInt(row.amount) })),
         supply,
@@ -200,6 +201,11 @@ export async function checkTokenQuality(
     return rugcheckReason(mint.toBase58(), config);
   }
   return null;
+}
+
+async function thisMint(connection: Connection, mint: PublicKey): Promise<Buffer | null> {
+  const info = await connection.getAccountInfo(mint, connection.commitment);
+  return info ? Buffer.from(info.data) : null;
 }
 
 async function withChainActivity(

@@ -1,6 +1,6 @@
 import { MarketCache, PoolCache } from './cache';
 import { Listeners } from './listeners';
-import { Connection, KeyedAccountInfo, Keypair } from '@solana/web3.js';
+import { AccountInfo, Connection, KeyedAccountInfo, Keypair } from '@solana/web3.js';
 import { LIQUIDITY_STATE_LAYOUT_V4, MARKET_STATE_LAYOUT_V3, Token, TokenAmount } from '@raydium-io/raydium-sdk';
 import { AccountLayout, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { Bot, BotConfig } from './bot';
@@ -71,6 +71,12 @@ import {
   SL_CONFIRMATIONS,
   SELL_RETRY_INTERVAL_MS,
   RPC_MIN_INTERVAL_MS,
+  RPC_MAX_CONCURRENCY,
+  RPC_HEAVY_INTERVAL_MS,
+  RPC_SEND_INTERVAL_MS,
+  RPC_RETRY_ATTEMPTS,
+  RPC_RETRY_BUDGET_MS,
+  SEND_RPC_ENDPOINT,
   QUALITY_FILTERS,
   QUALITY_CHECK_SELLABLE,
   MAX_TRANSFER_FEE_BPS,
@@ -95,14 +101,35 @@ import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-exe
 import { DryRunTransactionExecutor } from './transactions/dry-run-transaction-executor';
 import { BuyerTracker, CreatorBlacklist } from './pump/tracking';
 import { limitConnection } from './helpers/rpc-limit';
+import { rpcFetch } from './helpers/rpc-fetch';
+import { loadStaticPumpAccounts } from './pump/static-accounts';
 
-const connection = limitConnection(
-  new Connection(RPC_ENDPOINT, {
-    wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
-    commitment: COMMITMENT_LEVEL,
-  }),
-  RPC_MIN_INTERVAL_MS,
-);
+const staticCache = new Map<string, AccountInfo<Buffer>>();
+const rpcOptions = {
+  minIntervalMs: RPC_MIN_INTERVAL_MS,
+  maxConcurrency: RPC_MAX_CONCURRENCY,
+  heavyIntervalMs: RPC_HEAVY_INTERVAL_MS,
+  sendIntervalMs: RPC_SEND_INTERVAL_MS,
+  attempts: RPC_RETRY_ATTEMPTS,
+  budgetMs: RPC_RETRY_BUDGET_MS,
+  baseDelayMs: 200,
+  staticCache,
+};
+
+function openConnection(endpoint: string, websocket: boolean): Connection {
+  return limitConnection(
+    new Connection(endpoint, {
+      wsEndpoint: websocket ? RPC_WEBSOCKET_ENDPOINT : undefined,
+      commitment: COMMITMENT_LEVEL,
+      fetch: rpcFetch,
+      disableRetryOnRateLimit: true,
+    }),
+    rpcOptions,
+  );
+}
+
+const connection = openConnection(RPC_ENDPOINT, true);
+const sendConnection = SEND_RPC_ENDPOINT ? openConnection(SEND_RPC_ENDPOINT, false) : connection;
 
 function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
   logger.info(`
@@ -213,6 +240,11 @@ function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
     logger.info(`RugCheck: ${botConfig.quality.rugcheck} max score ${botConfig.quality.rugcheckMaxScore}`);
   }
 
+  logger.info(
+    `RPC spacing ${RPC_MIN_INTERVAL_MS}ms, concurrency ${RPC_MAX_CONCURRENCY}, heavy calls ${RPC_HEAVY_INTERVAL_MS}ms, sends ${RPC_SEND_INTERVAL_MS}ms`,
+  );
+  logger.info(`Send RPC: ${SEND_RPC_ENDPOINT || 'same as the read RPC'}`);
+
   logger.info('------- CONFIGURATION END -------');
 
   logger.info('Bot is running! Press CTRL + C to stop it.');
@@ -252,7 +284,7 @@ const runListener = async () => {
         break;
       }
       default: {
-        txExecutor = new DefaultTransactionExecutor(connection);
+        txExecutor = new DefaultTransactionExecutor(connection, sendConnection);
         break;
       }
     }
@@ -330,6 +362,8 @@ const runListener = async () => {
       rugcheckTimeoutMs: RUGCHECK_TIMEOUT_MS,
       rugcheckFailOpen: RUGCHECK_FAIL_OPEN,
     },
+    staticGlobal:
+      ENABLE_PUMPFUN || ENABLE_PUMPSWAP ? (await loadStaticPumpAccounts(connection, staticCache)).global : null,
   };
 
   const bot = new Bot(connection, marketCache, poolCache, txExecutor, botConfig);

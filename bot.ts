@@ -29,6 +29,7 @@ import { TOKEN_ACCOUNT_RENT_LAMPORTS } from './pump/constants';
 import { CreatePoolEvent, PumpCreateEvent } from './pump/events';
 import { PumpFilterConfig } from './pump/filters';
 import { PositionBook } from './pump/positions';
+import { PumpGlobalAccount } from './pump/layout';
 import { QualityConfig } from './pump/quality';
 import { BuyerTracker, CreatorBlacklist } from './pump/tracking';
 import { PumpTrader } from './pump/trader';
@@ -75,6 +76,7 @@ export interface BotConfig {
   pumpFilters: PumpFilterConfig;
   pumpBuyerWaitMs: number;
   quality: QualityConfig;
+  staticGlobal: PumpGlobalAccount | null;
   blacklist: CreatorBlacklist;
   buyers: BuyerTracker;
 }
@@ -143,6 +145,7 @@ export class Bot {
         checkFreezable: config.checkFreezable,
         checkMutable: config.checkMutable,
         quality: config.quality,
+        staticGlobal: config.staticGlobal,
       },
       this.positions,
       config.buyers,

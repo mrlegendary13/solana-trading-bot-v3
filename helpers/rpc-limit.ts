@@ -1,5 +1,6 @@
-import { Connection } from '@solana/web3.js';
+import { AccountInfo, Connection, PublicKey } from '@solana/web3.js';
 import { sleep } from './promises';
+import { isTransientRpcError } from './rpc-error';
 
 const LIMITED = new Set([
   'getAccountInfo',
@@ -12,31 +13,49 @@ const LIMITED = new Set([
   'getTransaction',
   'getSignaturesForAddress',
   'getTokenLargestAccounts',
+  'getProgramAccounts',
   'getParsedTokenAccountsByOwner',
   'sendRawTransaction',
   'simulateTransaction',
   'confirmTransaction',
 ]);
 
+const HEAVY = new Set(['getTokenLargestAccounts', 'getProgramAccounts']);
+
+export interface RpcLimitOptions {
+  minIntervalMs: number;
+  maxConcurrency: number;
+  heavyIntervalMs: number;
+  attempts: number;
+  budgetMs: number;
+  baseDelayMs: number;
+  /** Minimum gap between sendRawTransaction calls. Reads are not delayed by this. */
+  sendIntervalMs?: number;
+  /** Successful reads of accounts that do not change. Bonding curves are not stored here. */
+  staticCache?: Map<string, AccountInfo<Buffer>>;
+}
+
 /**
- * Serializes RPC calls and backs off when Chainstack returns 429.
- * Websocket subscriptions are left alone.
+ * Spaces RPC calls, caps how many run at once, and retries transient network
+ * errors. sendRawTransaction is retried only by repeating the same call, which
+ * resends the same signed bytes.
  */
-export function limitConnection(connection: Connection, minIntervalMs = 80): Connection {
-  let chain: Promise<unknown> = Promise.resolve();
-  const enqueue = <T>(run: () => Promise<T>): Promise<T> => {
-    const next = chain.then(async () => {
-      if (minIntervalMs > 0) {
-        await sleep(minIntervalMs);
-      }
-      return with429Retry(run);
-    });
-    chain = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
-  };
+export function limitConnection(connection: Connection, options: number | RpcLimitOptions): Connection {
+  const opts: RpcLimitOptions =
+    typeof options === 'number'
+      ? {
+          minIntervalMs: options,
+          maxConcurrency: 1,
+          heavyIntervalMs: options,
+          attempts: 3,
+          budgetMs: 1500,
+          baseDelayMs: 200,
+          sendIntervalMs: 0,
+        }
+      : options;
+  const gate = new RpcGate(Math.max(1, opts.maxConcurrency));
+  const cache = opts.staticCache;
+  const paceSend = createSendPacer(opts.sendIntervalMs ?? 0);
 
   return new Proxy(connection, {
     get(target, prop, receiver) {
@@ -44,24 +63,114 @@ export function limitConnection(connection: Connection, minIntervalMs = 80): Con
       if (typeof prop !== 'string' || typeof value !== 'function' || !LIMITED.has(prop)) {
         return typeof value === 'function' ? value.bind(target) : value;
       }
-      return (...args: unknown[]) => enqueue(() => (value as (...a: unknown[]) => Promise<unknown>).apply(target, args));
+      const method = value as (...args: unknown[]) => Promise<unknown>;
+      const gap = HEAVY.has(prop) ? Math.max(opts.minIntervalMs, opts.heavyIntervalMs) : opts.minIntervalMs;
+      return (...args: unknown[]) => {
+        if (prop === 'getAccountInfo' && cache) {
+          const key = accountKey(args[0]);
+          if (key && cache.has(key)) {
+            return Promise.resolve(cache.get(key));
+          }
+        }
+        return withRpcRetries(
+          async () => {
+            if (prop === 'sendRawTransaction') {
+              await paceSend();
+            }
+            await gate.acquire(gap);
+            try {
+              return await method.apply(target, args);
+            } finally {
+              gate.release();
+            }
+          },
+          opts,
+        );
+      };
     },
   });
 }
 
-async function with429Retry<T>(run: () => Promise<T>): Promise<T> {
-  let wait = 400;
-  for (let attempt = 0; attempt < 5; attempt++) {
+export async function withRpcRetries<T>(
+  run: () => Promise<T>,
+  opts: { attempts: number; budgetMs: number; baseDelayMs: number },
+): Promise<T> {
+  const started = Date.now();
+  let last: unknown;
+  const attempts = Math.max(1, opts.attempts);
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       return await run();
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/429|too many requests/i.test(message) || attempt === 4) {
+      last = error;
+      const remaining = opts.budgetMs - (Date.now() - started);
+      if (!isTransientRpcError(error) || attempt === attempts - 1 || remaining <= 0) {
         throw error;
       }
-      await sleep(wait);
-      wait *= 2;
+      const base = opts.baseDelayMs * 2 ** attempt;
+      const delay = Math.min(remaining, Math.round(base * (0.5 + Math.random())));
+      await sleep(delay);
     }
   }
-  throw new Error('RPC retry exhausted');
+  throw last;
+}
+
+export function createSendPacer(intervalMs: number): () => Promise<void> {
+  if (intervalMs <= 0) {
+    return async () => undefined;
+  }
+  let lastSend = 0;
+  let chain: Promise<void> = Promise.resolve();
+  return () => {
+    const run = chain.then(async () => {
+      const wait = lastSend + intervalMs - Date.now();
+      if (wait > 0) {
+        await sleep(wait);
+      }
+      lastSend = Date.now();
+    });
+    chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
+class RpcGate {
+  private inFlight = 0;
+  private readonly waiters: Array<() => void> = [];
+  private nextAt = 0;
+
+  constructor(private readonly maxConcurrency: number) {}
+
+  async acquire(gapMs: number): Promise<void> {
+    if (this.inFlight >= this.maxConcurrency) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    } else {
+      this.inFlight += 1;
+    }
+    const now = Date.now();
+    const start = Math.max(now, this.nextAt);
+    this.nextAt = start + Math.max(0, gapMs);
+    if (start > now) {
+      await sleep(start - now);
+    }
+  }
+
+  release() {
+    const next = this.waiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    this.inFlight = Math.max(0, this.inFlight - 1);
+  }
+}
+
+function accountKey(value: unknown): string | null {
+  if (value instanceof PublicKey) {
+    return value.toBase58();
+  }
+  return null;
 }

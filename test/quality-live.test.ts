@@ -126,10 +126,17 @@ async function main() {
     supply: 0n,
     excludeAccounts: [],
   };
-  const goodDecision = await checkTokenQuality(connection, new PublicKey(GOOD), rugcheckOnly, buyers, idle);
-  const copycatDecision = await checkTokenQuality(connection, new PublicKey(COPYCAT), rugcheckOnly, buyers, idle);
-  const serialDecision = await checkTokenQuality(connection, new PublicKey(SERIAL), rugcheckOnly, buyers, idle);
-  const thinDecision = await checkTokenQuality(connection, new PublicKey(THIN), rugcheckOnly, buyers, idle);
+  const decide = async (mint: string) => {
+    const first = await checkTokenQuality(connection, new PublicKey(mint), rugcheckOnly, buyers, idle);
+    if (first !== 'rugcheck request failed') {
+      return first;
+    }
+    return checkTokenQuality(connection, new PublicKey(mint), rugcheckOnly, buyers, idle);
+  };
+  const goodDecision = await decide(GOOD);
+  const copycatDecision = await decide(COPYCAT);
+  const serialDecision = await decide(SERIAL);
+  const thinDecision = await decide(THIN);
   console.log(`rugcheck good=${goodDecision ?? 'pass'} copycat=${copycatDecision} serial=${serialDecision} thin=${thinDecision}`);
   assert.strictEqual(goodDecision, null);
   assert.match(copycatDecision ?? '', /rugcheck score/);

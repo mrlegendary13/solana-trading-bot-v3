@@ -82,7 +82,10 @@ Raydium pool-size, burn, and socials filters do not run on pump venues. Mint ren
 - `SL_GRACE_MS` — ignore stop-loss for this many milliseconds after the buy. Default `2000`.
 - `SL_CONFIRMATIONS` — stop-loss readings required in a row. Default `2`.
 - `SELL_RETRY_INTERVAL_MS` — after `MAX_SELL_RETRIES`, wait this long and try the sell again. Default `15000`. The position stays open until the balance is gone.
-- `RPC_MIN_INTERVAL_MS` — minimum gap between RPC calls. Default `80` (about 12 per second). A 429 waits and retries.
+- `RPC_MIN_INTERVAL_MS` — gap between RPC starts. Default `20`, which is 50 requests per second, the Helius Developer cap.
+- `RPC_MAX_CONCURRENCY` — RPC calls in flight. Default `8`.
+- `RPC_HEAVY_INTERVAL_MS` — gap before `getProgramAccounts` and `getTokenLargestAccounts`. Default `40` (25 per second, the Developer `getProgramAccounts` cap).
+- `RPC_SEND_INTERVAL_MS` — gap between `sendTransaction` calls only. Default `200` (5 per second, the Developer send cap). Reads are not delayed by it.
 - `TAKE_PROFIT` / `STOP_LOSS` — percent from the quote spent.
 - `SELL_SLIPPAGE` — starting sell slippage percent.
 - `SELL_SLIPPAGE_STEP` — added on each failed sell, capped at 99 until the final attempt.
@@ -161,6 +164,25 @@ Known risks:
 - Token-2022 accounts with extensions are watched without a fixed data-size filter. A mint whose account cannot be closed will fail the close instruction; the last sell attempts omit it.
 - Warp and Jito still send signed transactions to third parties when selected.
 - This is not a promise of profit. Sniping new tokens is a way to lose the quote amount.
+
+## RPC and Helius
+
+One `Connection` serves reads and the log websocket. HTTP goes through a single undici agent with keep-alive, a 10 second connect timeout, and `autoSelectFamily`. Startup calls `dns.setDefaultResultOrder('ipv4first')`. A second connection is opened only when `SEND_RPC_ENDPOINT` is set, and it does not open a websocket. `sendRawTransaction` is retried only by sending the same signed bytes after a socket error or HTTP 429.
+
+Static pump accounts (global, fee config, event authority, and the PumpSwap copies) are read once at startup. Bonding curves are not cached. Each new mint prefetches its curve, mint, and creator token account in one `getMultipleAccounts`.
+
+`TypeError: fetch failed` is a socket failure. The log includes `code`, `errno`, and `hostname` from `error.cause` (`ECONNRESET`, `UND_ERR_CONNECT_TIMEOUT`, `ENOTFOUND`, `EAI_AGAIN`, or a socket closed by a rate limit).
+
+These numbers are the limits published at [Helius rate limits](https://www.helius.dev/docs/billing/rate-limits). The defaults are the Developer row. `RPC_MIN_INTERVAL_MS` is `1000 / RPC requests per second`. `RPC_SEND_INTERVAL_MS` is `1000 / sendTransaction per second` and does not slow account reads. `RPC_HEAVY_INTERVAL_MS` follows the `getProgramAccounts` cap. `getTokenLargestAccounts` is not given its own cap; it counts toward the plan RPC rate, and the heavy gap keeps those calls at the slower pace.
+
+| Plan | RPC | sendTransaction | getProgramAccounts | interval | concurrency | heavy | send gap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Free | 10/s | 1/s | 5/s | 100 | 2 | 200 | 1000 |
+| Developer | 50/s | 5/s | 25/s | 20 | 8 | 40 | 200 |
+| Business | 200/s | 50/s | 50/s | 5 | 16 | 20 | 20 |
+| Professional | 500/s | 100/s | 75/s | 2 | 32 | 14 | 10 |
+
+Sender with an API key is 50 requests per second on every plan. The keyless `/fast` URL is 1 request per second per IP. `SEND_RPC_ENDPOINT` can point at either; the send gap above is for the standard `sendTransaction` method.
 
 ## Harmless startup warning
 

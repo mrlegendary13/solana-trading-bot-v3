@@ -123,8 +123,18 @@ export const SL_CONFIRMATIONS = envNum('SL_CONFIRMATIONS', 2);
 export const SL_GRACE_MS = envNum('SL_GRACE_MS', 2000);
 // After MAX_SELL_RETRIES, wait this long and try the sell again.
 export const SELL_RETRY_INTERVAL_MS = envNum('SELL_RETRY_INTERVAL_MS', 15000);
-// Minimum gap between RPC calls. 80ms is about 12 requests per second.
-export const RPC_MIN_INTERVAL_MS = envNum('RPC_MIN_INTERVAL_MS', 80);
+// Gap between RPC starts. 20ms is 50 requests per second, the Helius Developer cap.
+export const RPC_MIN_INTERVAL_MS = envNum('RPC_MIN_INTERVAL_MS', 20);
+// In-flight reads. Eight covers a ~160ms round trip without going past 50 starts per second.
+export const RPC_MAX_CONCURRENCY = envNum('RPC_MAX_CONCURRENCY', 8);
+// getProgramAccounts is capped at 25/s on Developer. getTokenLargestAccounts shares the 50/s RPC cap.
+export const RPC_HEAVY_INTERVAL_MS = envNum('RPC_HEAVY_INTERVAL_MS', 40);
+// sendTransaction is capped at 5/s on Developer. This gap applies only to sends.
+export const RPC_SEND_INTERVAL_MS = envNum('RPC_SEND_INTERVAL_MS', 200);
+export const RPC_RETRY_ATTEMPTS = envNum('RPC_RETRY_ATTEMPTS', 3);
+export const RPC_RETRY_BUDGET_MS = envNum('RPC_RETRY_BUDGET_MS', 1500);
+// Optional send-only RPC, such as a Helius staked or sender URL. Empty uses RPC_ENDPOINT.
+export const SEND_RPC_ENDPOINT = envStr('SEND_RPC_ENDPOINT', '');
 
 // Pre-buy quality checks for pump.fun and PumpSwap. A percent or count of 0 disables that one check.
 export const QUALITY_FILTERS = envBool('QUALITY_FILTERS', true);

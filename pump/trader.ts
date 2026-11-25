@@ -7,7 +7,7 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
-import { getAccount, getAssociatedTokenAddressSync, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { getAccount, getAssociatedTokenAddressSync, MintLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { logger } from '../helpers/logger';
 import { sleep } from '../helpers/promises';
 import { watchAccountUntil } from '../helpers/price-watch';
@@ -36,6 +36,7 @@ import {
   wrapSolIxs,
 } from './instructions';
 import { decodeBondingCurve, decodePumpAmmGlobal, decodePumpGlobal, decodePumpSwapPool, PumpGlobalAccount } from './layout';
+import { tokenAccountAmount } from './static-accounts';
 import { isTokenProgram, readMintFlags } from './mint-flags';
 import { bondingCurvePda, canonicalPumpPoolPda, pumpAmmGlobalConfigPda, pumpGlobalPda, pumpPoolAuthorityPda } from './pda';
 import { PositionBook, PumpPosition, PumpSwapPosition } from './positions';
@@ -79,6 +80,7 @@ export interface PumpTradeConfig {
   checkFreezable: boolean;
   checkMutable: boolean;
   quality: QualityConfig;
+  staticGlobal: PumpGlobalAccount | null;
 }
 
 interface BuiltTransaction {
@@ -91,8 +93,10 @@ interface BuiltTransaction {
  * same transaction executor, so default / warp / jito and dry-run apply here.
  */
 export class PumpTrader {
-  private pumpGlobal: PumpGlobalAccount | null | undefined;
+  private pumpGlobal: PumpGlobalAccount | null = null;
+  private globalFetched = false;
   private pumpGlobalWarned = false;
+  private cachedBuybackAta: PublicKey | null = null;
 
   constructor(
     private readonly connection: Connection,
@@ -138,8 +142,13 @@ export class PumpTrader {
       await sleep(this.config.quality.waitMs);
     }
 
-    const curveInfo = await this.connection.getAccountInfo(bondingCurvePda(event.mint), this.connection.commitment);
-    const curve = curveInfo ? decodeBondingCurve(curveInfo.data as Buffer) : null;
+    const curvePk = bondingCurvePda(event.mint);
+    const creatorAta = getAssociatedTokenAddressSync(event.mint, event.creator, true, tokenProgram);
+    const [curveInfo, mintInfo, creatorInfo] = await this.connection.getMultipleAccountsInfo(
+      [curvePk, event.mint, creatorAta],
+      this.connection.commitment,
+    );
+    const curve = curveInfo ? decodeBondingCurve(Buffer.from(curveInfo.data)) : null;
     if (!curve) {
       logger.debug({ mint }, 'Skipping pump create because the bonding curve account is missing');
       return null;
@@ -150,7 +159,7 @@ export class PumpTrader {
       event.realTokenReserves > 0n
         ? event.realTokenReserves
         : (global?.initialRealTokenReserves ?? DEFAULT_INITIAL_REAL_TOKEN_RESERVES);
-    const creatorTokens = await this.tokenBalance(event.mint, event.creator, tokenProgram);
+    const creatorTokens = tokenAccountAmount(creatorInfo?.data);
     const devBuyLamports = curve.virtualTokenReserves > 0n ? (creatorTokens * curve.virtualQuoteReserves) / curve.virtualTokenReserves : 0n;
     const creatorHoldPercent = curve.tokenTotalSupply > 0n ? Number((creatorTokens * 10_000n) / curve.tokenTotalSupply) / 100 : 0;
 
@@ -177,17 +186,16 @@ export class PumpTrader {
       devBuyPct: creatorHoldPercent,
       realSol: Number(curve.realQuoteReserves) / 1_000_000_000,
       supply: curve.tokenTotalSupply,
-      excludeAccounts: [
-        getAssociatedTokenAddressSync(event.mint, bondingCurvePda(event.mint), true, tokenProgram).toBase58(),
-      ],
-      activityAccount: bondingCurvePda(event.mint),
+      excludeAccounts: [getAssociatedTokenAddressSync(event.mint, curvePk, true, tokenProgram).toBase58()],
+      activityAccount: curvePk,
+      mintData: mintInfo ? Buffer.from(mintInfo.data) : undefined,
     });
     if (qualityReason) {
       logger.info({ mint }, `Skipping ${mint}: ${qualityReason}`);
       return null;
     }
 
-    if (!(await this.mintAllowed(event.mint))) {
+    if (!(await this.mintAllowed(event.mint, mintInfo ? Buffer.from(mintInfo.data) : undefined))) {
       return null;
     }
 
@@ -338,8 +346,11 @@ export class PumpTrader {
       await sleep(this.config.quality.waitMs);
     }
 
-    const poolInfo = await this.connection.getAccountInfo(event.pool, this.connection.commitment);
-    const pool = poolInfo ? decodePumpSwapPool(poolInfo.data as Buffer) : null;
+    const [poolInfo, prefetchedMint] = await this.connection.getMultipleAccountsInfo(
+      [event.pool, oriented.tokenMint],
+      this.connection.commitment,
+    );
+    const pool = poolInfo ? decodePumpSwapPool(Buffer.from(poolInfo.data)) : null;
     if (!pool) {
       logger.debug({ mint }, 'Skipping PumpSwap pool because the account could not be decoded');
       return null;
@@ -354,16 +365,23 @@ export class PumpTrader {
       return null;
     }
     const tokenMint = poolOrient.tokenMint;
-    const tokenProgram = await this.resolveTokenProgram(tokenMint, TOKEN_PROGRAM_ID);
+    const tokenProgram =
+      prefetchedMint && isTokenProgram(prefetchedMint.owner)
+        ? prefetchedMint.owner
+        : await this.resolveTokenProgram(tokenMint, TOKEN_PROGRAM_ID);
     if (!tokenProgram) {
       return null;
     }
 
-    const reserves = await this.poolReserves(pool.poolBaseTokenAccount, pool.poolQuoteTokenAccount, pool.virtualQuoteReserves);
-    if (!reserves) {
-      return null;
-    }
+    const [baseInfo, quoteInfo] = await this.connection.getMultipleAccountsInfo(
+      [pool.poolBaseTokenAccount, pool.poolQuoteTokenAccount],
+      this.connection.commitment,
+    );
     const virtualQuote = pool.virtualQuoteReserves > 0n ? pool.virtualQuoteReserves : 0n;
+    const reserves = {
+      base: tokenAccountAmount(baseInfo?.data),
+      quote: tokenAccountAmount(quoteInfo?.data) + virtualQuote,
+    };
     const realSolLamports = poolOrient.tokenIsBase ? reserves.quote - virtualQuote : reserves.base;
     const qualityReason = await checkTokenQuality(this.connection, tokenMint, this.config.quality, this.buyers, {
       creator: event.coinCreator.toBase58(),
@@ -372,12 +390,13 @@ export class PumpTrader {
       supply: 0n,
       excludeAccounts: [pool.poolBaseTokenAccount.toBase58(), pool.poolQuoteTokenAccount.toBase58()],
       activityAccount: event.pool,
+      mintData: prefetchedMint ? Buffer.from(prefetchedMint.data) : undefined,
     });
     if (qualityReason) {
       logger.info({ mint: tokenMint.toBase58() }, `Skipping ${tokenMint.toBase58()}: ${qualityReason}`);
       return null;
     }
-    if (!(await this.mintAllowed(tokenMint))) {
+    if (!(await this.mintAllowed(tokenMint, prefetchedMint ? Buffer.from(prefetchedMint.data) : undefined))) {
       return null;
     }
     const feeBps = PUMPSWAP_LP_FEE_BPS + PUMPSWAP_PROTOCOL_FEE_BPS + higherFee(pool.creatorFeeBps, PUMPSWAP_CREATOR_FEE_BPS);
@@ -795,14 +814,17 @@ export class PumpTrader {
   }
 
   private async loadPumpGlobal(): Promise<PumpGlobalAccount | null> {
-    if (this.pumpGlobal !== undefined) {
+    if (this.config.staticGlobal) {
+      return this.config.staticGlobal;
+    }
+    if (this.globalFetched) {
       return this.pumpGlobal;
     }
     try {
       const info = await this.connection.getAccountInfo(pumpGlobalPda(), this.connection.commitment);
-      this.pumpGlobal = info ? decodePumpGlobal(info.data as Buffer) : null;
+      this.pumpGlobal = info ? decodePumpGlobal(Buffer.from(info.data)) : null;
+      this.globalFetched = true;
     } catch (error) {
-      this.pumpGlobal = null;
       if (!this.pumpGlobalWarned) {
         this.pumpGlobalWarned = true;
         logger.warn({ error }, 'Could not read pump Global. Fee quotes use the published fee schedule.');
@@ -822,6 +844,9 @@ export class PumpTrader {
   }
 
   private async pumpSwapBuybackAta(): Promise<PublicKey | null> {
+    if (this.cachedBuybackAta) {
+      return this.cachedBuybackAta;
+    }
     try {
       const info = await this.connection.getAccountInfo(pumpAmmGlobalConfigPda(), this.connection.commitment);
       const global = info ? decodePumpAmmGlobal(info.data as Buffer) : null;
@@ -833,6 +858,7 @@ export class PumpTrader {
       const accounts = await this.connection.getMultipleAccountsInfo(atas, this.connection.commitment);
       for (let i = 0; i < atas.length; i++) {
         if (accounts[i]) {
+          this.cachedBuybackAta = atas[i];
           return atas[i];
         }
       }
@@ -908,9 +934,23 @@ export class PumpTrader {
     return null;
   }
 
-  private async mintAllowed(mint: PublicKey): Promise<boolean> {
+  private async mintAllowed(mint: PublicKey, prefetched?: Buffer): Promise<boolean> {
     if (!this.config.checkRenounced && !this.config.checkFreezable && !this.config.checkMutable) {
       return true;
+    }
+    if (prefetched && prefetched.length >= MintLayout.span) {
+      const decoded = MintLayout.decode(prefetched);
+      if (this.config.checkRenounced && decoded.mintAuthorityOption !== 0) {
+        logger.debug({ mint: mint.toBase58() }, 'Skipping because mint authority is set');
+        return false;
+      }
+      if (this.config.checkFreezable && decoded.freezeAuthorityOption !== 0) {
+        logger.debug({ mint: mint.toBase58() }, 'Skipping because the mint is freezable');
+        return false;
+      }
+      if (!this.config.checkMutable) {
+        return true;
+      }
     }
     const flags = await readMintFlags(this.connection, mint);
     if (!flags) {
