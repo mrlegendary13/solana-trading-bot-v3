@@ -81,7 +81,8 @@ Raydium pool-size, burn, and socials filters do not run on pump venues. Mint ren
 - `PRICE_CHECK_WEBSOCKET` — also reprice when the Raydium quote vault, bonding curve, or PumpSwap quote vault changes. Polling still runs if the socket dies.
 - `SL_GRACE_MS` — ignore stop-loss for this many milliseconds after the buy. Default `2000`.
 - `SL_CONFIRMATIONS` — stop-loss readings required in a row. Default `2`.
-- `SELL_RETRY_INTERVAL_MS` — after `MAX_SELL_RETRIES`, wait this long and try the sell again. Default `15000`. The position stays open until the balance is gone.
+- `SELL_RETRY_INTERVAL_MS` — after a sell fails, wait this long before trying again. Default `15000`. Each attempt re-reads the balance and the curve. A program error such as Overflow is not sent again unchanged.
+- `PNL_LOG_INTERVAL_MS` — how often an open position logs `Position PnL` at info. Default `10000`. `0` disables it. Take profit and stop loss still log their own trigger line.
 - `RPC_MIN_INTERVAL_MS` — gap between RPC starts. Default `20`, which is 50 requests per second, the Helius Developer cap.
 - `RPC_MAX_CONCURRENCY` — RPC calls in flight. Default `8`.
 - `RPC_HEAVY_INTERVAL_MS` — gap before `getProgramAccounts` and `getTokenLargestAccounts`. Default `40` (25 per second, the Developer `getProgramAccounts` cap).

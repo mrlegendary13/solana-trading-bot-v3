@@ -70,6 +70,7 @@ import {
   SL_GRACE_MS,
   SL_CONFIRMATIONS,
   SELL_RETRY_INTERVAL_MS,
+  PNL_LOG_INTERVAL_MS,
   RPC_MIN_INTERVAL_MS,
   RPC_MAX_CONCURRENCY,
   RPC_HEAVY_INTERVAL_MS,
@@ -383,6 +384,7 @@ const runListener = async () => {
       graceMs: SL_GRACE_MS,
       confirmations: SL_CONFIRMATIONS,
       sellRetryIntervalMs: SELL_RETRY_INTERVAL_MS,
+      pnlLogIntervalMs: PNL_LOG_INTERVAL_MS,
       useWebsocket: PRICE_CHECK_WEBSOCKET,
     });
   }

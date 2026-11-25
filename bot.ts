@@ -161,6 +161,7 @@ export class Bot {
     graceMs: number;
     confirmations: number;
     sellRetryIntervalMs: number;
+    pnlLogIntervalMs: number;
     useWebsocket: boolean;
   }) {
     this.positionMonitor = new PositionMonitor(this.connection, this.pumpTrader, this.config.wallet.publicKey, config);

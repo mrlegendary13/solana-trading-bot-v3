@@ -1,7 +1,9 @@
 import assert from 'assert';
 import { evaluateExit, pnlBps } from '../pump/exit';
 import { buyFailureShouldStop } from '../transactions/tx-error';
-import { quoteBondingCurveSell } from '../pump/quotes';
+import { maxSafeSellAmount, quoteBondingCurveSell, sellChunkAmounts } from '../pump/quotes';
+import { sellFailureClass } from '../transactions/tx-error';
+import { serializeLogError } from '../helpers/logger';
 
 const base = {
   solIn: 10_000_000n,
@@ -33,5 +35,20 @@ assert.strictEqual(buyFailureShouldStop('blockhash expired at height 10'), false
 
 const mark = quoteBondingCurveSell(299674225407n, 1_000_000_000_000_000n, 30_000_000_000n, 95n, 30n);
 assert.ok(mark > 0n);
+
+const virtualSol = 128_510_536_696n;
+const cap = maxSafeSellAmount(virtualSol);
+assert.ok(cap > 0n);
+assert.ok(cap * virtualSol <= (1n << 64n) - 1n);
+assert.ok((cap + 2n) * virtualSol > (1n << 64n) - 1n);
+const chunks = sellChunkAmounts(cap * 3n + 10n, cap, 20);
+assert.deepStrictEqual(chunks, [cap, cap, cap, 10n]);
+assert.strictEqual(sellFailureClass('simulation failed: {"InstructionError":[2,{"Custom":6024}]} | Overflow'), 'retry');
+assert.strictEqual(sellFailureClass('TooLittleSolReceived'), 'slippage');
+assert.strictEqual(sellFailureClass('custom program error: 0x1788'), 'retry');
+assert.strictEqual(sellFailureClass('BondingCurveComplete'), 'fatal');
+const logged = serializeLogError('simulation failed: Overflow');
+assert.strictEqual(logged.message, 'simulation failed: Overflow');
+assert.strictEqual(Object.keys(logged).some((key) => key === '0'), false);
 
 console.log('exit tests passed');

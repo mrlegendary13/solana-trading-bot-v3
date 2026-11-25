@@ -17,7 +17,27 @@ export function simulationFailure(err: unknown, logs: string[] | null | undefine
   return tail ? `${summary} | ${tail}` : summary;
 }
 
-/** Buy retries cannot fix these. Sell retries still run so slippage can increase. */
+/** Slippage can be fixed by widening the minimum. Overflow and other program errors cannot. */
+export function sellFailureClass(error?: string): 'slippage' | 'fatal' | 'retry' {
+  if (!error) {
+    return 'retry';
+  }
+  if (/6003|TooLittleSolReceived/i.test(error)) {
+    return 'slippage';
+  }
+  if (/6024|0x1788|Overflow/i.test(error)) {
+    return 'retry';
+  }
+  if (/6004|6005|6006|6022|6023|NotEnoughTokens|BondingCurveComplete|insufficient lamports|insufficient funds/i.test(error)) {
+    return 'fatal';
+  }
+  if (/InstructionError|custom program error/i.test(error)) {
+    return 'fatal';
+  }
+  return 'retry';
+}
+
+/** Buy retries cannot fix these. 6042 is a buy slippage miss and is retried once with a fresh quote. */
 export function buyFailureShouldStop(error?: string): boolean {
   if (!error) {
     return false;

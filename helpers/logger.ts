@@ -19,14 +19,8 @@ export const logger = pino(
     level: 'info',
     redact: ['poolKeys', 'privateKey', 'secretKey', 'mnemonic', 'seed', 'PRIVATE_KEY'],
     serializers: {
-      error(error: Error) {
-        const details = describeRpcError(error);
-        return {
-          ...pino.stdSerializers.err(error),
-          code: details.code,
-          errno: details.errno,
-          hostname: details.hostname,
-        };
+      error(error: unknown) {
+        return serializeLogError(error);
       },
     },
     base: undefined,
@@ -35,3 +29,20 @@ export const logger = pino(
 );
 
 export const logFilePath = logFile;
+
+/** Strings must stay strings. Pino's error serializer otherwise copies each character as a field. */
+export function serializeLogError(error: unknown): Record<string, unknown> {
+  if (typeof error === 'string') {
+    return { message: error };
+  }
+  if (!(error instanceof Error)) {
+    return { message: describeRpcError(error).message || String(error) };
+  }
+  const details = describeRpcError(error);
+  return {
+    ...pino.stdSerializers.err(error),
+    code: details.code,
+    errno: details.errno,
+    hostname: details.hostname,
+  };
+}

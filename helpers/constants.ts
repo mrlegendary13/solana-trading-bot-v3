@@ -123,6 +123,8 @@ export const SL_CONFIRMATIONS = envNum('SL_CONFIRMATIONS', 2);
 export const SL_GRACE_MS = envNum('SL_GRACE_MS', 2000);
 // After MAX_SELL_RETRIES, wait this long and try the sell again.
 export const SELL_RETRY_INTERVAL_MS = envNum('SELL_RETRY_INTERVAL_MS', 15000);
+// How often an open position logs its PnL at info. 0 disables the line.
+export const PNL_LOG_INTERVAL_MS = envNum('PNL_LOG_INTERVAL_MS', 10000);
 // Gap between RPC starts. 20ms is 50 requests per second, the Helius Developer cap.
 export const RPC_MIN_INTERVAL_MS = envNum('RPC_MIN_INTERVAL_MS', 20);
 // In-flight reads. Eight covers a ~160ms round trip without going past 50 starts per second.

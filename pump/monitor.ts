@@ -19,6 +19,7 @@ export interface MonitorConfig {
   graceMs: number;
   confirmations: number;
   sellRetryIntervalMs: number;
+  pnlLogIntervalMs: number;
   useWebsocket: boolean;
 }
 
@@ -33,6 +34,7 @@ interface Watched {
   swap?: PumpSwapPosition;
   selling: boolean;
   nextSellAtMs: number;
+  lastPnlLogMs: number;
 }
 
 const FILE = path.join(process.cwd(), 'data', 'positions.json');
@@ -88,6 +90,7 @@ export class PositionMonitor {
       swap: input.swap,
       selling: false,
       nextSellAtMs: 0,
+      lastPnlLogMs: 0,
     };
     this.watched.set(input.mint.toBase58(), row);
     this.persist();
@@ -136,6 +139,7 @@ export class PositionMonitor {
       streak: 0,
       selling: false,
       nextSellAtMs: 0,
+      lastPnlLogMs: 0,
     };
     if (pool && (!curve || curve.complete)) {
       row.swap = swapFromPool(mint, poolPk, pool, tokenProgram);
@@ -191,9 +195,6 @@ export class PositionMonitor {
     if (!row || row.selling) {
       return;
     }
-    if (row.nextSellAtMs > Date.now()) {
-      return;
-    }
     try {
       const quote = await this.quote(row);
       if (!quote) {
@@ -212,16 +213,33 @@ export class PositionMonitor {
         durationMs: this.config.priceCheckDurationMs,
       });
       row.streak = decision.streak;
-      logger.debug(
-        { mint, pnlPercent: (decision.pnlBps / 100).toFixed(2), valueSol: solToString(quote.sol), entrySol: solToString(row.solIn) },
-        'Position price check',
-      );
+      const pnlPercent = (decision.pnlBps / 100).toFixed(2);
+      const now = Date.now();
+      const pnlEvery = Math.max(0, this.config.pnlLogIntervalMs);
+      if (pnlEvery > 0 && now - row.lastPnlLogMs >= pnlEvery) {
+        row.lastPnlLogMs = now;
+        logger.info(
+          { mint, pnlPercent, valueSol: solToString(quote.sol), entrySol: solToString(row.solIn), tokens: row.tokens.toString() },
+          'Position PnL',
+        );
+      }
       if (decision.decision === 'hold') {
         return;
       }
+      if (row.nextSellAtMs > now) {
+        logger.info(
+          { mint, reason: decision.decision, pnlPercent, retryInMs: row.nextSellAtMs - now },
+          'Exit is due, but the last sell is still in its retry wait.',
+        );
+        return;
+      }
       logger.info(
-        { mint, reason: decision.decision, pnlPercent: (decision.pnlBps / 100).toFixed(2), valueSol: solToString(quote.sol) },
-        'Sell triggered',
+        { mint, reason: decision.decision, pnlPercent, valueSol: solToString(quote.sol), entrySol: solToString(row.solIn) },
+        decision.decision === 'take-profit'
+          ? 'Take profit triggered. Sending the sell.'
+          : decision.decision === 'stop-loss'
+            ? 'Stop loss triggered. Sending the sell.'
+            : 'Price check timed out. Sending the sell.',
       );
       await this.sell(row, decision.decision);
     } catch (error) {
@@ -282,13 +300,15 @@ export class PositionMonitor {
         : row.pump
           ? await this.trader.sellPump(row.pump, balance, { skipWatch: true })
           : false;
+      const left = await this.tokenBalance(row);
+      row.tokens = left;
+      if (left <= 0n) {
+        logger.info({ mint: row.mint.toBase58(), reason, entrySol: solToString(row.solIn) }, 'Position sold');
+        this.forget(row.mint.toBase58(), reason);
+        return;
+      }
       if (sold) {
-        const left = await this.tokenBalance(row);
-        if (left <= 0n) {
-          logger.info({ mint: row.mint.toBase58(), reason, entrySol: solToString(row.solIn) }, 'Position sold');
-          this.forget(row.mint.toBase58(), reason);
-          return;
-        }
+        return;
       }
       row.nextSellAtMs = Date.now() + this.config.sellRetryIntervalMs;
       logger.error(
