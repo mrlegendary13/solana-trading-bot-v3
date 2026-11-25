@@ -12,6 +12,7 @@ import {
   getAccount,
   getAssociatedTokenAddress,
   RawAccount,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
@@ -28,9 +29,11 @@ import { TOKEN_ACCOUNT_RENT_LAMPORTS } from './pump/constants';
 import { CreatePoolEvent, PumpCreateEvent } from './pump/events';
 import { PumpFilterConfig } from './pump/filters';
 import { PositionBook } from './pump/positions';
+import { QualityConfig } from './pump/quality';
 import { BuyerTracker, CreatorBlacklist } from './pump/tracking';
 import { PumpTrader } from './pump/trader';
 import { sellSlippageForAttempt } from './pump/quotes';
+import { PositionMonitor } from './pump/monitor';
 
 export interface BotConfig {
   wallet: Keypair;
@@ -71,6 +74,7 @@ export interface BotConfig {
   enablePumpswap: boolean;
   pumpFilters: PumpFilterConfig;
   pumpBuyerWaitMs: number;
+  quality: QualityConfig;
   blacklist: CreatorBlacklist;
   buyers: BuyerTracker;
 }
@@ -86,6 +90,7 @@ export class Bot {
   private openPositionMint: string | null = null;
   private readonly positions = new PositionBook();
   private readonly pumpTrader: PumpTrader;
+  private positionMonitor?: PositionMonitor;
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
 
@@ -137,11 +142,27 @@ export class Bot {
         checkRenounced: config.checkRenounced,
         checkFreezable: config.checkFreezable,
         checkMutable: config.checkMutable,
+        quality: config.quality,
       },
       this.positions,
       config.buyers,
       config.blacklist,
     );
+  }
+
+  watchOpenPositions(config: {
+    takeProfitPercent: number;
+    stopLossPercent: number;
+    priceCheckIntervalMs: number;
+    priceCheckDurationMs: number;
+    graceMs: number;
+    confirmations: number;
+    sellRetryIntervalMs: number;
+    useWebsocket: boolean;
+  }) {
+    this.positionMonitor = new PositionMonitor(this.connection, this.pumpTrader, this.config.wallet.publicKey, config);
+    this.positionMonitor.start();
+    return this.positionMonitor.reconcile();
   }
 
   async validate() {
@@ -280,6 +301,9 @@ export class Bot {
     try {
       logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
       const amount = BigInt(rawAccount.amount.toString());
+      if (this.positionMonitor && (tokenProgramId.equals(TOKEN_2022_PROGRAM_ID) || this.positions.get(rawAccount.mint.toString()))) {
+        return;
+      }
       if (amount === 0n) {
         if (this.config.closeEmptyTokenAccounts) {
           await this.closeEmptyTokenAccount(accountId, tokenProgramId);
@@ -574,17 +598,14 @@ export class Bot {
       if (!result) {
         return;
       }
-      logger.info(
-        { mint, tokensOut: result.tokensOut.toString(), spendLamports: this.config.quoteAmount.raw.toString() },
-        this.config.dryRun ? 'DRY_RUN simulated buy' : 'Pump buy submitted',
-      );
-      if (this.config.dryRun && this.config.autoSell) {
-        logger.info(
-          { mint, priceCheckDurationMs: this.config.priceCheckDuration },
-          'DRY_RUN simulated position is open. Watching price until take-profit, stop-loss, or the price-check duration, then simulating the sell.',
-        );
-        const sold = await this.pumpTrader.sellPump(result.position, result.tokensOut);
-        logger.info({ mint, sold }, 'DRY_RUN simulated sell');
+      if (this.positionMonitor && this.config.autoSell) {
+        await this.positionMonitor.onBuy({
+          mint: event.mint,
+          tokenProgram: result.position.baseTokenProgram,
+          tokens: result.tokensOut,
+          solIn: result.solIn ?? BigInt(this.config.quoteAmount.raw.toString()),
+          pump: result.position,
+        });
       }
     } catch (error) {
       logger.error({ mint, error }, 'Failed to buy pump token');
@@ -623,22 +644,15 @@ export class Bot {
       if (!result) {
         return;
       }
-      logger.info(
-        {
-          mint,
-          tokensOut: result.tokensOut.toString(),
-          tokenIsBase: result.position.tokenIsBase,
-          spendLamports: this.config.quoteAmount.raw.toString(),
-        },
-        this.config.dryRun ? 'DRY_RUN simulated buy' : 'PumpSwap buy submitted',
-      );
-      if (this.config.dryRun && this.config.autoSell) {
-        logger.info(
-          { mint, priceCheckDurationMs: this.config.priceCheckDuration },
-          'DRY_RUN simulated position is open. Watching price until take-profit, stop-loss, or the price-check duration, then simulating the sell.',
-        );
-        const sold = await this.pumpTrader.sellPumpSwap(result.position, result.tokensOut);
-        logger.info({ mint, sold }, 'DRY_RUN simulated sell');
+      if (this.positionMonitor && this.config.autoSell) {
+        const tokenProgram = result.position.tokenIsBase ? result.position.baseTokenProgram : result.position.quoteTokenProgram;
+        await this.positionMonitor.onBuy({
+          mint: result.position.mint,
+          tokenProgram,
+          tokens: result.tokensOut,
+          solIn: result.solIn ?? BigInt(this.config.quoteAmount.raw.toString()),
+          swap: result.position,
+        });
       }
     } catch (error) {
       logger.error({ mint, error }, 'Failed to buy PumpSwap token');

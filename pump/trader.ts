@@ -24,6 +24,7 @@ import {
   PUMPSWAP_PROTOCOL_FEE_BPS,
 } from './constants';
 import { CreatePoolEvent, PumpCreateEvent } from './events';
+import { fillFromTransaction } from './fill';
 import { evaluatePumpFilters, PumpFilterConfig } from './filters';
 import {
   closeBaseAtaIx,
@@ -50,6 +51,7 @@ import {
   quotePumpSwapSell,
   sellSlippageForAttempt,
 } from './quotes';
+import { QualityConfig, checkTokenQuality } from './quality';
 import { BuyerTracker, CreatorBlacklist } from './tracking';
 
 export interface PumpTradeConfig {
@@ -76,6 +78,7 @@ export interface PumpTradeConfig {
   checkRenounced: boolean;
   checkFreezable: boolean;
   checkMutable: boolean;
+  quality: QualityConfig;
 }
 
 interface BuiltTransaction {
@@ -131,6 +134,9 @@ export class PumpTrader {
         await sleep(200);
       }
     }
+    if (this.config.quality.enabled && this.config.quality.waitMs > 0) {
+      await sleep(this.config.quality.waitMs);
+    }
 
     const curveInfo = await this.connection.getAccountInfo(bondingCurvePda(event.mint), this.connection.commitment);
     const curve = curveInfo ? decodeBondingCurve(curveInfo.data as Buffer) : null;
@@ -162,7 +168,22 @@ export class PumpTrader {
       blacklisted: this.blacklist.has(event.creator.toBase58()),
     });
     if (!decision.ok) {
-      logger.debug({ mint }, decision.message);
+      logger.info({ mint }, decision.message);
+      return null;
+    }
+
+    const qualityReason = await checkTokenQuality(this.connection, event.mint, this.config.quality, this.buyers, {
+      creator: event.creator.toBase58(),
+      devBuyPct: creatorHoldPercent,
+      realSol: Number(curve.realQuoteReserves) / 1_000_000_000,
+      supply: curve.tokenTotalSupply,
+      excludeAccounts: [
+        getAssociatedTokenAddressSync(event.mint, bondingCurvePda(event.mint), true, tokenProgram).toBase58(),
+      ],
+      activityAccount: bondingCurvePda(event.mint),
+    });
+    if (qualityReason) {
+      logger.info({ mint }, `Skipping ${mint}: ${qualityReason}`);
       return null;
     }
 
@@ -214,7 +235,7 @@ export class PumpTrader {
     expected: bigint;
     recipient: PublicKey;
     creator: PublicKey;
-  }): Promise<{ tokensOut: bigint; position: PumpPosition } | null> {
+  }): Promise<{ tokensOut: bigint; solIn?: bigint; position: PumpPosition } | null> {
     const { event, tokenProgram, initialReal, protocolFeeBps, creatorFeeBps, expected, recipient } = screened;
     const mint = event.mint.toBase58();
     const balance = BigInt(await this.connection.getBalance(this.config.wallet.publicKey));
@@ -237,7 +258,7 @@ export class PumpTrader {
     };
     this.positions.set(position);
 
-    const bought = await this.execute(mint, 'buy', async (slippage) => {
+    const attempt = await this.execute(mint, 'buy', async (slippage) => {
       const fresh = await this.readCurve(event.mint);
       const quoted = fresh
         ? quoteBondingCurveBuy(this.config.quoteLamports, fresh.virtualTokenReserves, fresh.virtualQuoteReserves, protocolFeeBps, creatorFeeBps)
@@ -258,13 +279,19 @@ export class PumpTrader {
       ]);
     });
 
-    if (!bought) {
-      this.positions.delete(mint);
-      return null;
+    if (!attempt.ok) {
+      const landed = await this.tokenBalance(event.mint, this.config.wallet.publicKey, tokenProgram);
+      if (landed <= 0n) {
+        this.positions.delete(mint);
+        return null;
+      }
+      logger.warn({ mint, tokens: landed.toString() }, 'Buy confirmation failed but the tokens arrived. The position stays open.');
+      return { tokensOut: landed, position };
     }
 
-    logger.info({ mint, creator: event.creator.toBase58(), tokensOut: expected.toString() }, 'Pump buy transaction confirmed');
-    return { tokensOut: expected, position };
+    const filled = await this.fillFromSignature(attempt.signature, event.mint);
+    logger.info({ mint, creator: event.creator.toBase58(), tokensOut: (filled?.tokens ?? expected).toString() }, 'Pump buy transaction confirmed');
+    return { tokensOut: filled?.tokens ?? expected, solIn: filled?.solIn, position };
   }
 
   async screenPool(event: CreatePoolEvent): Promise<{
@@ -304,8 +331,11 @@ export class PumpTrader {
       return null;
     }
     if (this.blacklist.has(event.coinCreator.toBase58()) || this.blacklist.has(event.creator.toBase58())) {
-      logger.debug({ mint }, 'Skipping PumpSwap pool from a blacklisted creator');
+      logger.info({ mint }, `Skipping ${mint}: creator is blacklisted`);
       return null;
+    }
+    if (this.config.quality.enabled && this.config.quality.waitMs > 0) {
+      await sleep(this.config.quality.waitMs);
     }
 
     const poolInfo = await this.connection.getAccountInfo(event.pool, this.connection.commitment);
@@ -325,12 +355,29 @@ export class PumpTrader {
     }
     const tokenMint = poolOrient.tokenMint;
     const tokenProgram = await this.resolveTokenProgram(tokenMint, TOKEN_PROGRAM_ID);
-    if (!tokenProgram || !(await this.mintAllowed(tokenMint))) {
+    if (!tokenProgram) {
       return null;
     }
 
     const reserves = await this.poolReserves(pool.poolBaseTokenAccount, pool.poolQuoteTokenAccount, pool.virtualQuoteReserves);
     if (!reserves) {
+      return null;
+    }
+    const virtualQuote = pool.virtualQuoteReserves > 0n ? pool.virtualQuoteReserves : 0n;
+    const realSolLamports = poolOrient.tokenIsBase ? reserves.quote - virtualQuote : reserves.base;
+    const qualityReason = await checkTokenQuality(this.connection, tokenMint, this.config.quality, this.buyers, {
+      creator: event.coinCreator.toBase58(),
+      devBuyPct: 0,
+      realSol: Number(realSolLamports > 0n ? realSolLamports : 0n) / 1_000_000_000,
+      supply: 0n,
+      excludeAccounts: [pool.poolBaseTokenAccount.toBase58(), pool.poolQuoteTokenAccount.toBase58()],
+      activityAccount: event.pool,
+    });
+    if (qualityReason) {
+      logger.info({ mint: tokenMint.toBase58() }, `Skipping ${tokenMint.toBase58()}: ${qualityReason}`);
+      return null;
+    }
+    if (!(await this.mintAllowed(tokenMint))) {
       return null;
     }
     const feeBps = PUMPSWAP_LP_FEE_BPS + PUMPSWAP_PROTOCOL_FEE_BPS + higherFee(pool.creatorFeeBps, PUMPSWAP_CREATOR_FEE_BPS);
@@ -371,7 +418,7 @@ export class PumpTrader {
     feeBps: bigint;
     expected: bigint;
     buybackAta: PublicKey;
-  }): Promise<{ tokensOut: bigint; position: PumpSwapPosition } | null> {
+  }): Promise<{ tokensOut: bigint; solIn?: bigint; position: PumpSwapPosition } | null> {
     const { position, feeBps, expected, buybackAta } = screened;
     const mint = position.mint.toBase58();
     const balance = BigInt(await this.connection.getBalance(this.config.wallet.publicKey));
@@ -386,7 +433,7 @@ export class PumpTrader {
     this.positions.set(position);
     const deficit = await this.wrapDeficit(this.config.quoteLamports);
     const tokenProgram = position.tokenIsBase ? position.baseTokenProgram : position.quoteTokenProgram;
-    const bought = await this.execute(mint, 'buy', async (slippage) => {
+    const attempt = await this.execute(mint, 'buy', async (slippage) => {
       const live = await this.poolReserves(
         position.poolBaseTokenAccount,
         position.poolQuoteTokenAccount,
@@ -433,14 +480,20 @@ export class PumpTrader {
       ]);
     });
 
-    if (!bought) {
-      this.positions.delete(mint);
-      return null;
+    if (!attempt.ok) {
+      const landed = await this.tokenBalance(position.mint, this.config.wallet.publicKey, tokenProgram);
+      if (landed <= 0n) {
+        this.positions.delete(mint);
+        return null;
+      }
+      logger.warn({ mint, tokens: landed.toString() }, 'PumpSwap confirmation failed but the tokens arrived. The position stays open.');
+      return { tokensOut: landed, position };
     }
-    return { tokensOut: expected, position };
+    const filled = await this.fillFromSignature(attempt.signature, position.mint);
+    return { tokensOut: filled?.tokens ?? expected, solIn: filled?.solIn, position };
   }
 
-  async sellPump(position: PumpPosition, amount: bigint): Promise<boolean> {
+  async sellPump(position: PumpPosition, amount: bigint, options?: { skipWatch?: boolean }): Promise<boolean> {
     if (amount <= 0n) {
       return false;
     }
@@ -471,13 +524,15 @@ export class PumpTrader {
       return false;
     }
 
-    await this.holdForExit(position.bondingCurve, async () => {
-      const live = await this.readCurve(position.mint);
-      if (!live) {
-        throw new Error('bonding curve missing');
-      }
-      return quoteBondingCurveSell(amount, live.virtualTokenReserves, live.virtualQuoteReserves, protocolFeeBps, creatorFeeBps);
-    });
+    if (!options?.skipWatch) {
+      await this.holdForExit(position.bondingCurve, async () => {
+        const live = await this.readCurve(position.mint);
+        if (!live) {
+          throw new Error('bonding curve missing');
+        }
+        return quoteBondingCurveSell(amount, live.virtualTokenReserves, live.virtualQuoteReserves, protocolFeeBps, creatorFeeBps);
+      });
+    }
 
     const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
       const live = await this.readCurve(position.mint);
@@ -501,13 +556,13 @@ export class PumpTrader {
         ...(includeClose ? [closeBaseAtaIx(position.mint, this.config.wallet.publicKey, position.baseTokenProgram)] : []),
       ]);
     });
-    if (sold) {
+    if (sold.ok) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold;
+    return sold.ok;
   }
 
-  async sellPumpSwap(position: PumpSwapPosition, amount: bigint): Promise<boolean> {
+  async sellPumpSwap(position: PumpSwapPosition, amount: bigint, options?: { skipWatch?: boolean }): Promise<boolean> {
     if (amount <= 0n) {
       return false;
     }
@@ -522,16 +577,18 @@ export class PumpTrader {
     }
     const feeBps = PUMPSWAP_LP_FEE_BPS + PUMPSWAP_PROTOCOL_FEE_BPS + higherFee(position.creatorFeeBps, PUMPSWAP_CREATOR_FEE_BPS);
     if (!position.tokenIsBase) {
-      return this.sellFlippedPumpSwap(position, amount, buybackAta, feeBps);
+      return this.sellFlippedPumpSwap(position, amount, buybackAta, feeBps, options);
     }
 
-    await this.holdForExit(position.poolQuoteTokenAccount, async () => {
-      const reserves = await this.poolReserves(position.poolBaseTokenAccount, position.poolQuoteTokenAccount, position.virtualQuoteReserves);
-      if (!reserves) {
-        throw new Error('pool reserves missing');
-      }
-      return quotePumpSwapSell(amount, reserves.base, reserves.quote, feeBps);
-    });
+    if (!options?.skipWatch) {
+      await this.holdForExit(position.poolQuoteTokenAccount, async () => {
+        const reserves = await this.poolReserves(position.poolBaseTokenAccount, position.poolQuoteTokenAccount, position.virtualQuoteReserves);
+        if (!reserves) {
+          throw new Error('pool reserves missing');
+        }
+        return quotePumpSwapSell(amount, reserves.base, reserves.quote, feeBps);
+      });
+    }
 
     const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
       const reserves = await this.poolReserves(
@@ -562,10 +619,10 @@ export class PumpTrader {
         ...(includeClose ? [closeBaseAtaIx(position.mint, this.config.wallet.publicKey, position.baseTokenProgram)] : []),
       ]);
     });
-    if (sold) {
+    if (sold.ok) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold;
+    return sold.ok;
   }
 
   /** SOL is the pool base and the token is the quote. Spend the token to receive SOL. */
@@ -574,7 +631,9 @@ export class PumpTrader {
     amount: bigint,
     buybackAta: PublicKey,
     feeBps: bigint,
+    options?: { skipWatch?: boolean },
   ): Promise<boolean> {
+    if (!options?.skipWatch) {
     await this.holdForExit(position.poolBaseTokenAccount, async () => {
       const reserves = await this.poolReserves(
         position.poolBaseTokenAccount,
@@ -586,6 +645,7 @@ export class PumpTrader {
       }
       return quotePumpSwapBuy(amount, reserves.base, reserves.quote, feeBps);
     });
+    }
 
     const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
       const reserves = await this.poolReserves(
@@ -618,10 +678,10 @@ export class PumpTrader {
           : []),
       ]);
     });
-    if (sold) {
+    if (sold.ok) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold;
+    return sold.ok;
   }
 
   private async positionFromCanonicalPool(position: PumpPosition): Promise<PumpSwapPosition | null> {
@@ -673,11 +733,11 @@ export class PumpTrader {
     mint: string,
     direction: 'buy' | 'sell',
     build: (slippage: number, attempt: number, max: number) => Promise<BuiltTransaction | null>,
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; signature?: string }> {
     const max = direction === 'buy' ? this.config.maxBuyRetries : this.config.maxSellRetries;
     const base = direction === 'buy' ? this.config.buySlippage : this.config.sellSlippage;
     if (max <= 0) {
-      return false;
+      return { ok: false };
     }
 
     for (let attempt = 0; attempt < max; attempt++) {
@@ -689,12 +749,12 @@ export class PumpTrader {
         logger.info({ mint }, `Send ${direction} transaction attempt: ${attempt + 1}/${max} (slippage ${slippage}%)`);
         const built = await build(slippage, attempt, max);
         if (!built) {
-          return false;
+          return { ok: false };
         }
         const result = await this.txExecutor.executeAndConfirm(built.transaction, this.config.wallet, built.blockhash);
         if (result.confirmed) {
           logger.info({ mint, signature: result.signature }, `Confirmed ${direction} tx`);
-          return true;
+          return { ok: true, signature: result.signature };
         }
         logger.error(
           { mint, signature: result.signature, error: result.error, attempt: attempt + 1, max },
@@ -705,13 +765,13 @@ export class PumpTrader {
           /insufficient lamports|insufficient funds/i.test(result.error || '') ||
           (direction === 'buy' && buyFailureShouldStop(result.error));
         if (stop) {
-          return false;
+          return { ok: false, signature: result.signature };
         }
       } catch (error) {
         logger.error({ mint, error, attempt: attempt + 1, max }, `${direction} attempt threw`);
       }
     }
-    return false;
+    return { ok: false };
   }
 
   private async compile(instructions: TransactionInstruction[]): Promise<BuiltTransaction> {
@@ -797,6 +857,22 @@ export class PumpTrader {
       return { base: BigInt(baseBalance.value.amount), quote: quoteReserve };
     } catch (error) {
       logger.debug({ error }, 'Failed to read PumpSwap reserves');
+      return null;
+    }
+  }
+
+  private async fillFromSignature(signature: string | undefined, mint: PublicKey) {
+    if (!signature || signature === 'dry-run') {
+      return null;
+    }
+    try {
+      const tx = await this.connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      if (!tx) {
+        return null;
+      }
+      return fillFromTransaction(tx, this.config.wallet.publicKey, mint);
+    } catch (error) {
+      logger.debug({ mint: mint.toBase58(), error }, 'Could not read the buy fill. Entry falls back to the quote.');
       return null;
     }
   }

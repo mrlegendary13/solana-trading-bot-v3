@@ -418,8 +418,8 @@ async function testLiveGlobalAndSimulate() {
   assert.ok(mintInfo);
   // Public trader account used only as a fee payer inside simulateTransaction.
   // Signature verification is off, so this does not broadcast or spend their SOL.
-  const payer = new PublicKey('8CyZqkTQN2CjqQ2mEbSHWGbH5BHcFhk2bCgeY1S1LN3r');
-  assert.ok((await connection.getBalance(payer)) > 20_000_000);
+  const payer = new PublicKey('AouHuc2LYNYkp34qNig1DHAtZon2tQT9XP25uTt3W7hc');
+  assert.ok((await connection.getBalance(payer)) > 5_000_000);
   const { blockhash } = await connection.getLatestBlockhash();
   const message = new TransactionMessage({
     payerKey: payer,
@@ -431,7 +431,7 @@ async function testLiveGlobalAndSimulate() {
         user: payer,
         mint,
         baseTokenProgram: mintInfo.owner,
-        spendableQuoteIn: 10_000_000n,
+        spendableQuoteIn: 1_000_000n,
         minTokensOut: 1n,
         buybackFeeRecipient: global.buybackFeeRecipients[0],
       }),

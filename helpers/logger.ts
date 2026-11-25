@@ -1,7 +1,16 @@
-import pino from 'pino'; 
+import fs from 'fs';
+import path from 'path';
+import pino from 'pino';
+
+const logDir = path.join(process.cwd(), 'logs');
+fs.mkdirSync(logDir, { recursive: true });
+const logFile = path.join(logDir, `${new Date().toISOString().slice(0, 10)}.log`);
 
 const transport = pino.transport({
-  target: 'pino-pretty',
+  targets: [
+    { target: 'pino-pretty', options: { destination: 1 } },
+    { target: 'pino/file', options: { destination: logFile, mkdir: true } },
+  ],
 });
 
 export const logger = pino(
@@ -15,3 +24,5 @@ export const logger = pino(
   },
   transport,
 );
+
+export const logFilePath = logFile;

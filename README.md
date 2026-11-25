@@ -78,7 +78,11 @@ Raydium pool-size, burn, and socials filters do not run on pump venues. Mint ren
 - `AUTO_SELL_DELAY` — milliseconds before the sell path starts.
 - `PRICE_CHECK_INTERVAL` — heartbeat, in milliseconds, for take-profit and stop-loss. `0` disables both.
 - `PRICE_CHECK_DURATION` — give up and sell after this many milliseconds.
-- `PRICE_CHECK_WEBSOCKET` — also reprice when the Raydium quote vault, bonding curve, or PumpSwap quote vault changes.
+- `PRICE_CHECK_WEBSOCKET` — also reprice when the Raydium quote vault, bonding curve, or PumpSwap quote vault changes. Polling still runs if the socket dies.
+- `SL_GRACE_MS` — ignore stop-loss for this many milliseconds after the buy. Default `2000`.
+- `SL_CONFIRMATIONS` — stop-loss readings required in a row. Default `2`.
+- `SELL_RETRY_INTERVAL_MS` — after `MAX_SELL_RETRIES`, wait this long and try the sell again. Default `15000`. The position stays open until the balance is gone.
+- `RPC_MIN_INTERVAL_MS` — minimum gap between RPC calls. Default `80` (about 12 per second). A 429 waits and retries.
 - `TAKE_PROFIT` / `STOP_LOSS` — percent from the quote spent.
 - `SELL_SLIPPAGE` — starting sell slippage percent.
 - `SELL_SLIPPAGE_STEP` — added on each failed sell, capped at 99 until the final attempt.
@@ -115,6 +119,34 @@ A numeric `0` disables that bound. `PUMP_MAX_CURVE_PROGRESS=100` allows any inco
 - `PUMP_ALLOW_NON_SOL_QUOTE` — reserved. Non-SOL quotes are not bought. A coin whose address ends in `pump` can still be quoted in another token. The skip log includes that quote mint. SOL quotes decode as the all-ones default pubkey or wrapped SOL. This was checked against a live `CreateV2` event.
 - `PUMP_CREATOR_BLACKLIST` — path to a text file of creator addresses. Reloaded when the file changes.
 
+### Token quality filters
+
+These run for pump.fun and PumpSwap after the filters above and before a buy. The skip line is logged at info and names the mint and the exact reason. Reads go through the shared RPC limiter: one mint account, one `getTokenLargestAccounts`, and one recent-signature read. A percent or count of `0` turns that check off.
+
+Recommended quality-over-speed values (also the defaults):
+
+| Setting | Recommended | What it does |
+| --- | --- | --- |
+| `QUALITY_FILTERS` | `true` | Master switch. |
+| `QUALITY_CHECK_SELLABLE` | `true` | Skip a freeze authority, a Token-2022 transfer hook, permanent delegate, non-transferable or pausable extension, or a transfer fee above `MAX_TRANSFER_FEE_BPS`. |
+| `MAX_TRANSFER_FEE_BPS` | `0` | Any Token-2022 transfer fee fails. |
+| `MAX_SINGLE_HOLDER_PCT` | `25` | Largest holder, excluding the bonding-curve or pool vault, as a percent of supply. |
+| `MAX_TOP10_PCT` | `60` | Top 10 holders combined, with the curve or pool vault excluded. |
+| `MAX_DEV_BUY_PCT` | `15` | Creator's initial balance as a percent of supply. |
+| `MAX_CREATOR_LAUNCHES` | `3` | Creates from that creator seen since this process started. The blacklist file still applies. |
+| `QUALITY_WAIT_MS` | `3000` | Delay after the create before the buy. |
+| `QUALITY_MIN_TRADES` | `3` | Buys plus sells in that window, or recent signatures on the curve or pool. |
+| `QUALITY_MIN_UNIQUE_BUYERS` | `3` | Distinct buyers seen on the log subscription. |
+| `QUALITY_MIN_BUY_SELL_RATIO` | `1` | Buys divided by sells. No sells means the ratio is not applied. |
+| `QUALITY_MAX_SAME_SLOT_BUYS` | `2` | Skip a bundle where more transactions than this land in the create slot. |
+| `QUALITY_MIN_REAL_SOL` | `2` | Minimum SOL already in the curve or pool, not counting virtual reserves. |
+| `RUGCHECK_ENABLED` | `true` for a stricter setup, default `false` | `GET https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary`. |
+| `RUGCHECK_MAX_SCORE` | `1000` | Skip when the returned score is higher. |
+| `RUGCHECK_TIMEOUT_MS` | `8000` | Request timeout. The summary endpoint sometimes takes several seconds. |
+| `RUGCHECK_FAIL_OPEN` | `true` | A timeout or HTTP error allows the buy. A score above the max still skips. Set `false` to skip when RugCheck cannot be reached. |
+
+Pair these with `PUMP_MIN_CURVE_PROGRESS=5` and `PUMP_MIN_MARKET_CAP_SOL=35` when you want the curve to have moved before entry. `PUMP_SKIP_MAYHEM=true` stays on.
+
 Program ids and instruction accounts come from `pump-fun/pump-public-docs` (`idl/pump.ts`, `idl/pump_amm.ts`, and the v3 / PumpSwap v2 trade docs). Bonding-curve fees in the quoter are 0.95% protocol + 0.30% creator. PumpSwap quotes use the 0–420 SOL tier from the 17 October 2026 fee schedule (0.93% protocol + 0.30% creator + 0.02% LP). A higher creator fee on the account is used when it is set. These quotes were not simulated against mainnet.
 
 ## What was not verified on mainnet
@@ -134,7 +166,9 @@ Known risks:
 
 `bigint: Failed to load bindings, pure JS will be used` comes from the `bigint-buffer` package when its optional native addon is not compiled. The pure JavaScript fallback is what this process uses. It does not change quotes, signatures, or which coins are bought.
 
-A failed buy logs `buy attempt failed` with the signature and the simulation or confirmation error. A deterministic program error, including `insufficient lamports`, is not retried. `DRY_RUN=true` simulates the signed transaction and stops on the first successful simulation. Keep about 0.006 SOL free above `QUOTE_AMOUNT` for the token account, the pump volume account, and the priority fee. At 250,000 compute units and a compute price of 200,000 micro-lamports, the priority fee is 0.00005 SOL.
+A failed buy logs `buy attempt failed` with the signature and the simulation or confirmation error. `BuySlippageBelowMinTokensOut` (6042) is re-quoted and retried. Other program errors and `insufficient lamports` are not retried. `DRY_RUN=true` simulates the signed transaction and stops on the first successful simulation. Keep about 0.006 SOL free above `QUOTE_AMOUNT` for the token account, the pump volume account, and the priority fee. At 250,000 compute units and a compute price of 200,000 micro-lamports, the priority fee is 0.00005 SOL.
+
+Each open position logs `Position opened` with the SOL that actually went into the trade, the take-profit price, and the stop-loss price. Debug lines show the mark. `Sell triggered` names the reason (`take-profit`, `stop-loss`, or `timeout`). The same lines are written to `logs/YYYY-MM-DD.log`. On startup the bot rebuilds positions from the wallet's token balances. A recovered coin is marked at the current sell value so it is not stop-sold immediately. When a bonding curve graduates, the position switches to the canonical PumpSwap pool.
 
 ## Scripts
 

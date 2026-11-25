@@ -67,17 +67,42 @@ import {
   PUMP_CHECK_IF_MUTABLE,
   PUMP_ALLOW_NON_SOL_QUOTE,
   PUMP_CREATOR_BLACKLIST,
+  SL_GRACE_MS,
+  SL_CONFIRMATIONS,
+  SELL_RETRY_INTERVAL_MS,
+  RPC_MIN_INTERVAL_MS,
+  QUALITY_FILTERS,
+  QUALITY_CHECK_SELLABLE,
+  MAX_TRANSFER_FEE_BPS,
+  MAX_SINGLE_HOLDER_PCT,
+  MAX_TOP10_PCT,
+  MAX_DEV_BUY_PCT,
+  MAX_CREATOR_LAUNCHES,
+  QUALITY_WAIT_MS,
+  QUALITY_MIN_TRADES,
+  QUALITY_MIN_UNIQUE_BUYERS,
+  QUALITY_MIN_BUY_SELL_RATIO,
+  QUALITY_MAX_SAME_SLOT_BUYS,
+  QUALITY_MIN_REAL_SOL,
+  RUGCHECK_ENABLED,
+  RUGCHECK_MAX_SCORE,
+  RUGCHECK_TIMEOUT_MS,
+  RUGCHECK_FAIL_OPEN,
 } from './helpers';
 import { version } from './package.json';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
 import { DryRunTransactionExecutor } from './transactions/dry-run-transaction-executor';
 import { BuyerTracker, CreatorBlacklist } from './pump/tracking';
+import { limitConnection } from './helpers/rpc-limit';
 
-const connection = new Connection(RPC_ENDPOINT, {
-  wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
-  commitment: COMMITMENT_LEVEL,
-});
+const connection = limitConnection(
+  new Connection(RPC_ENDPOINT, {
+    wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
+    commitment: COMMITMENT_LEVEL,
+  }),
+  RPC_MIN_INTERVAL_MS,
+);
 
 function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
   logger.info(`
@@ -172,6 +197,20 @@ function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
     logger.info(`Skip mayhem: ${botConfig.pumpFilters.skipMayhem}`);
     logger.info(`Pump check mutable: ${botConfig.checkMutable}`);
     logger.info(`Allow non-SOL quote: ${botConfig.pumpFilters.allowNonSolQuote}`);
+    logger.info(`Quality filters: ${botConfig.quality.enabled}`);
+    logger.info(`Sellability check: ${botConfig.quality.checkSellable}`);
+    logger.info(`Max transfer fee bps: ${botConfig.quality.maxTransferFeeBps}`);
+    logger.info(`Max single holder %: ${botConfig.quality.maxSingleHolderPct}`);
+    logger.info(`Max top 10 holders %: ${botConfig.quality.maxTop10Pct}`);
+    logger.info(`Max dev buy %: ${botConfig.quality.maxDevBuyPct}`);
+    logger.info(`Max creator launches this session: ${botConfig.quality.maxCreatorLaunches}`);
+    logger.info(`Quality wait: ${botConfig.quality.waitMs} ms`);
+    logger.info(`Min trades: ${botConfig.quality.minTrades}`);
+    logger.info(`Min unique buyers: ${botConfig.quality.minUniqueBuyers}`);
+    logger.info(`Min buy/sell ratio: ${botConfig.quality.minBuySellRatio}`);
+    logger.info(`Max same-slot buys: ${botConfig.quality.maxSameSlotBuys}`);
+    logger.info(`Min real SOL: ${botConfig.quality.minRealSol}`);
+    logger.info(`RugCheck: ${botConfig.quality.rugcheck} max score ${botConfig.quality.rugcheckMaxScore}`);
   }
 
   logger.info('------- CONFIGURATION END -------');
@@ -272,6 +311,25 @@ const runListener = async () => {
       skipMayhem: PUMP_SKIP_MAYHEM,
       allowNonSolQuote: PUMP_ALLOW_NON_SOL_QUOTE,
     },
+    quality: {
+      enabled: QUALITY_FILTERS,
+      checkSellable: QUALITY_CHECK_SELLABLE,
+      maxTransferFeeBps: MAX_TRANSFER_FEE_BPS,
+      maxSingleHolderPct: MAX_SINGLE_HOLDER_PCT,
+      maxTop10Pct: MAX_TOP10_PCT,
+      maxDevBuyPct: MAX_DEV_BUY_PCT,
+      maxCreatorLaunches: MAX_CREATOR_LAUNCHES,
+      waitMs: QUALITY_WAIT_MS,
+      minTrades: QUALITY_MIN_TRADES,
+      minUniqueBuyers: QUALITY_MIN_UNIQUE_BUYERS,
+      minBuySellRatio: QUALITY_MIN_BUY_SELL_RATIO,
+      maxSameSlotBuys: QUALITY_MAX_SAME_SLOT_BUYS,
+      minRealSol: QUALITY_MIN_REAL_SOL,
+      rugcheck: RUGCHECK_ENABLED,
+      rugcheckMaxScore: RUGCHECK_MAX_SCORE,
+      rugcheckTimeoutMs: RUGCHECK_TIMEOUT_MS,
+      rugcheckFailOpen: RUGCHECK_FAIL_OPEN,
+    },
   };
 
   const bot = new Bot(connection, marketCache, poolCache, txExecutor, botConfig);
@@ -280,6 +338,19 @@ const runListener = async () => {
   if (!valid) {
     logger.info('Bot is exiting...');
     process.exit(1);
+  }
+
+  if (AUTO_SELL && (ENABLE_PUMPFUN || ENABLE_PUMPSWAP)) {
+    await bot.watchOpenPositions({
+      takeProfitPercent: TAKE_PROFIT,
+      stopLossPercent: STOP_LOSS,
+      priceCheckIntervalMs: PRICE_CHECK_INTERVAL,
+      priceCheckDurationMs: PRICE_CHECK_DURATION,
+      graceMs: SL_GRACE_MS,
+      confirmations: SL_CONFIRMATIONS,
+      sellRetryIntervalMs: SELL_RETRY_INTERVAL_MS,
+      useWebsocket: PRICE_CHECK_WEBSOCKET,
+    });
   }
 
   if (ENABLE_RAYDIUM && PRE_LOAD_EXISTING_MARKETS) {

@@ -117,3 +117,30 @@ export const PUMP_SKIP_MAYHEM = envBool('PUMP_SKIP_MAYHEM', true);
 export const PUMP_CHECK_IF_MUTABLE = envBool('PUMP_CHECK_IF_MUTABLE', false);
 export const PUMP_ALLOW_NON_SOL_QUOTE = envBool('PUMP_ALLOW_NON_SOL_QUOTE', false);
 export const PUMP_CREATOR_BLACKLIST = envStr('PUMP_CREATOR_BLACKLIST', 'pump-creator-blacklist.txt');
+
+// Stop loss must be seen this many polls in a row, and only after the grace window.
+export const SL_CONFIRMATIONS = envNum('SL_CONFIRMATIONS', 2);
+export const SL_GRACE_MS = envNum('SL_GRACE_MS', 2000);
+// After MAX_SELL_RETRIES, wait this long and try the sell again.
+export const SELL_RETRY_INTERVAL_MS = envNum('SELL_RETRY_INTERVAL_MS', 15000);
+// Minimum gap between RPC calls. 80ms is about 12 requests per second.
+export const RPC_MIN_INTERVAL_MS = envNum('RPC_MIN_INTERVAL_MS', 80);
+
+// Pre-buy quality checks for pump.fun and PumpSwap. A percent or count of 0 disables that one check.
+export const QUALITY_FILTERS = envBool('QUALITY_FILTERS', true);
+export const QUALITY_CHECK_SELLABLE = envBool('QUALITY_CHECK_SELLABLE', true);
+export const MAX_TRANSFER_FEE_BPS = envNum('MAX_TRANSFER_FEE_BPS', 0);
+export const MAX_SINGLE_HOLDER_PCT = envNum('MAX_SINGLE_HOLDER_PCT', 25);
+export const MAX_TOP10_PCT = envNum('MAX_TOP10_PCT', 60);
+export const MAX_DEV_BUY_PCT = envNum('MAX_DEV_BUY_PCT', 15);
+export const MAX_CREATOR_LAUNCHES = envNum('MAX_CREATOR_LAUNCHES', 3);
+export const QUALITY_WAIT_MS = envNum('QUALITY_WAIT_MS', 3000);
+export const QUALITY_MIN_TRADES = envNum('QUALITY_MIN_TRADES', 3);
+export const QUALITY_MIN_UNIQUE_BUYERS = envNum('QUALITY_MIN_UNIQUE_BUYERS', 3);
+export const QUALITY_MIN_BUY_SELL_RATIO = envNum('QUALITY_MIN_BUY_SELL_RATIO', 1);
+export const QUALITY_MAX_SAME_SLOT_BUYS = envNum('QUALITY_MAX_SAME_SLOT_BUYS', 2);
+export const QUALITY_MIN_REAL_SOL = envNum('QUALITY_MIN_REAL_SOL', 2);
+export const RUGCHECK_ENABLED = envBool('RUGCHECK_ENABLED', false);
+export const RUGCHECK_MAX_SCORE = envNum('RUGCHECK_MAX_SCORE', 1000);
+export const RUGCHECK_TIMEOUT_MS = envNum('RUGCHECK_TIMEOUT_MS', 8000);
+export const RUGCHECK_FAIL_OPEN = envBool('RUGCHECK_FAIL_OPEN', true);

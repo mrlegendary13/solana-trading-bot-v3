@@ -22,5 +22,8 @@ export function buyFailureShouldStop(error?: string): boolean {
   if (!error) {
     return false;
   }
+  if (/6042|BuySlippageBelowMinTokensOut/i.test(error)) {
+    return false;
+  }
   return /insufficient lamports|custom program error|InstructionError|AccountNotFound|insufficient funds/i.test(error);
 }
