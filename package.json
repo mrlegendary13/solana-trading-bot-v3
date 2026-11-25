@@ -6,7 +6,7 @@
   "scripts": {
     "start": "ts-node index.ts",
     "tsc": "tsc --noEmit",
-    "test": "ts-node --transpile-only test/audit.test.ts"
+    "test": "ts-node --transpile-only test/exit.test.ts && ts-node --transpile-only test/quality.test.ts && ts-node --transpile-only test/rpc.test.ts && ts-node --transpile-only test/quality-live.test.ts && ts-node --transpile-only test/audit.test.ts"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.2.1",
@@ -23,7 +23,8 @@
     "ed25519-hd-key": "^1.3.0",
     "pino": "^8.18.0",
     "pino-pretty": "^10.3.1",
-    "pino-std-serializers": "^6.2.2"
+    "pino-std-serializers": "^6.2.2",
+    "undici": "^7.30.2"
   },
   "devDependencies": {
     "@types/bn.js": "^5.1.5",

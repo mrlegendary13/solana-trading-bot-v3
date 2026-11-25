@@ -3,7 +3,7 @@ import bs58 from 'bs58';
 import { Connection, GetProgramAccountsFilter, PublicKey } from '@solana/web3.js';
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { EventEmitter } from 'events';
-import { PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID } from '../pump/constants';
+import { PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, orientSolPair } from '../pump/constants';
 import { decodeProgramDataLogs, parseCreateEvent, parseCreatePoolEvent, parseTradeEvent } from '../pump/events';
 import { BuyerTracker } from '../pump/tracking';
 import { logger } from '../helpers/logger';
@@ -110,15 +110,22 @@ export class Listeners extends EventEmitter {
   private async subscribeToPumpCreates() {
     return this.connection.onLogs(
       PUMP_PROGRAM_ID,
-      (logs) => {
+      (logs, ctx) => {
         if (logs.err) {
           return;
         }
         try {
-          for (const data of decodeProgramDataLogs(logs.logs)) {
+          const events = [...decodeProgramDataLogs(logs.logs)];
+          for (const data of events) {
+            const created = parseCreateEvent(data);
+            if (created) {
+              this.buyers.noteCreate(created.mint.toBase58(), created.creator.toBase58(), ctx.slot);
+            }
+          }
+          for (const data of events) {
             const trade = parseTradeEvent(data);
-            if (trade?.isBuy) {
-              this.buyers.record(trade.mint.toBase58(), trade.user.toBase58());
+            if (trade) {
+              this.buyers.record(trade.mint.toBase58(), trade.user.toBase58(), trade.isBuy, ctx.slot);
             }
             const created = parseCreateEvent(data);
             if (created) {
@@ -136,7 +143,7 @@ export class Listeners extends EventEmitter {
   private async subscribeToPumpSwapPools() {
     return this.connection.onLogs(
       PUMP_AMM_PROGRAM_ID,
-      (logs) => {
+      (logs, ctx) => {
         if (logs.err) {
           return;
         }
@@ -144,6 +151,10 @@ export class Listeners extends EventEmitter {
           for (const data of decodeProgramDataLogs(logs.logs)) {
             const created = parseCreatePoolEvent(data);
             if (created) {
+              const oriented = orientSolPair(created.baseMint, created.quoteMint);
+              if (oriented) {
+                this.buyers.noteSlot(oriented.tokenMint.toBase58(), ctx.slot);
+              }
               this.emit('pumpPool', created);
             }
           }

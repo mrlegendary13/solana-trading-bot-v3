@@ -12,6 +12,7 @@ import {
   getAccount,
   getAssociatedTokenAddress,
   RawAccount,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
@@ -19,6 +20,7 @@ import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
 import { createPoolKeys, logger, NETWORK, sleep } from './helpers';
+import { buyFailureShouldStop } from './transactions/tx-error';
 import { watchAccountUntil } from './helpers/price-watch';
 import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
@@ -27,9 +29,12 @@ import { TOKEN_ACCOUNT_RENT_LAMPORTS } from './pump/constants';
 import { CreatePoolEvent, PumpCreateEvent } from './pump/events';
 import { PumpFilterConfig } from './pump/filters';
 import { PositionBook } from './pump/positions';
+import { PumpGlobalAccount } from './pump/layout';
+import { QualityConfig } from './pump/quality';
 import { BuyerTracker, CreatorBlacklist } from './pump/tracking';
 import { PumpTrader } from './pump/trader';
 import { sellSlippageForAttempt } from './pump/quotes';
+import { PositionMonitor } from './pump/monitor';
 
 export interface BotConfig {
   wallet: Keypair;
@@ -70,6 +75,8 @@ export interface BotConfig {
   enablePumpswap: boolean;
   pumpFilters: PumpFilterConfig;
   pumpBuyerWaitMs: number;
+  quality: QualityConfig;
+  staticGlobal: PumpGlobalAccount | null;
   blacklist: CreatorBlacklist;
   buyers: BuyerTracker;
 }
@@ -85,6 +92,7 @@ export class Bot {
   private openPositionMint: string | null = null;
   private readonly positions = new PositionBook();
   private readonly pumpTrader: PumpTrader;
+  private positionMonitor?: PositionMonitor;
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
 
@@ -136,11 +144,28 @@ export class Bot {
         checkRenounced: config.checkRenounced,
         checkFreezable: config.checkFreezable,
         checkMutable: config.checkMutable,
+        quality: config.quality,
+        staticGlobal: config.staticGlobal,
       },
       this.positions,
       config.buyers,
       config.blacklist,
     );
+  }
+
+  watchOpenPositions(config: {
+    takeProfitPercent: number;
+    stopLossPercent: number;
+    priceCheckIntervalMs: number;
+    priceCheckDurationMs: number;
+    graceMs: number;
+    confirmations: number;
+    sellRetryIntervalMs: number;
+    useWebsocket: boolean;
+  }) {
+    this.positionMonitor = new PositionMonitor(this.connection, this.pumpTrader, this.config.wallet.publicKey, config);
+    this.positionMonitor.start();
+    return this.positionMonitor.reconcile();
   }
 
   async validate() {
@@ -169,9 +194,9 @@ export class Bot {
 
     if (this.config.enablePumpfun || this.config.enablePumpswap) {
       const balance = BigInt(await this.connection.getBalance(this.config.wallet.publicKey, this.connection.commitment));
-      if (balance < quoteAtoms + 5_000_000n) {
+      if (balance < quoteAtoms + 6_000_000n) {
         logger.error(
-          'Wallet SOL balance is below the buy size plus a fee buffer. pump.fun buys spend native SOL, and PumpSwap wraps SOL in the buy transaction.',
+          `Wallet SOL balance is below the buy size plus about 0.006 SOL for the token account, pump volume account, and fees. Need ${quoteAtoms + 6_000_000n} lamports, have ${balance}.`,
         );
         return false;
       }
@@ -251,16 +276,20 @@ export class Bot {
             break;
           }
 
-          logger.info(
+          logger.error(
             {
               mint: poolState.baseMint.toString(),
               signature: result.signature,
               error: result.error,
+              attempt: i + 1,
             },
-            `Error confirming buy tx`,
+            'Raydium buy attempt failed',
           );
+          if (result.retryable === false || buyFailureShouldStop(result.error)) {
+            break;
+          }
         } catch (error) {
-          logger.debug({ mint: poolState.baseMint.toString(), error }, `Error confirming buy transaction`);
+          logger.error({ mint: poolState.baseMint.toString(), error, attempt: i + 1 }, 'Raydium buy attempt threw');
         }
       }
     } catch (error) {
@@ -275,6 +304,9 @@ export class Bot {
     try {
       logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
       const amount = BigInt(rawAccount.amount.toString());
+      if (this.positionMonitor && (tokenProgramId.equals(TOKEN_2022_PROGRAM_ID) || this.positions.get(rawAccount.mint.toString()))) {
+        return;
+      }
       if (amount === 0n) {
         if (this.config.closeEmptyTokenAccounts) {
           await this.closeEmptyTokenAccount(accountId, tokenProgramId);
@@ -362,16 +394,20 @@ export class Bot {
             break;
           }
 
-          logger.info(
+          logger.error(
             {
               mint: rawAccount.mint.toString(),
               signature: result.signature,
               error: result.error,
+              attempt: i + 1,
             },
-            `Error confirming sell tx`,
+            'Sell attempt failed',
           );
+          if (/insufficient lamports|insufficient funds/i.test(result.error || '')) {
+            break;
+          }
         } catch (error) {
-          logger.debug({ mint: rawAccount.mint.toString(), error }, `Error confirming sell transaction`);
+          logger.error({ mint: rawAccount.mint.toString(), error, attempt: i + 1 }, 'Sell attempt threw');
         }
       }
     } catch (error) {
@@ -565,17 +601,14 @@ export class Bot {
       if (!result) {
         return;
       }
-      logger.info(
-        { mint, tokensOut: result.tokensOut.toString(), spendLamports: this.config.quoteAmount.raw.toString() },
-        this.config.dryRun ? 'DRY_RUN simulated buy' : 'Pump buy submitted',
-      );
-      if (this.config.dryRun && this.config.autoSell) {
-        logger.info(
-          { mint, priceCheckDurationMs: this.config.priceCheckDuration },
-          'DRY_RUN simulated position is open. Watching price until take-profit, stop-loss, or the price-check duration, then simulating the sell.',
-        );
-        const sold = await this.pumpTrader.sellPump(result.position, result.tokensOut);
-        logger.info({ mint, sold }, 'DRY_RUN simulated sell');
+      if (this.positionMonitor && this.config.autoSell) {
+        await this.positionMonitor.onBuy({
+          mint: event.mint,
+          tokenProgram: result.position.baseTokenProgram,
+          tokens: result.tokensOut,
+          solIn: result.solIn ?? BigInt(this.config.quoteAmount.raw.toString()),
+          pump: result.position,
+        });
       }
     } catch (error) {
       logger.error({ mint, error }, 'Failed to buy pump token');
@@ -614,22 +647,15 @@ export class Bot {
       if (!result) {
         return;
       }
-      logger.info(
-        {
-          mint,
-          tokensOut: result.tokensOut.toString(),
-          tokenIsBase: result.position.tokenIsBase,
-          spendLamports: this.config.quoteAmount.raw.toString(),
-        },
-        this.config.dryRun ? 'DRY_RUN simulated buy' : 'PumpSwap buy submitted',
-      );
-      if (this.config.dryRun && this.config.autoSell) {
-        logger.info(
-          { mint, priceCheckDurationMs: this.config.priceCheckDuration },
-          'DRY_RUN simulated position is open. Watching price until take-profit, stop-loss, or the price-check duration, then simulating the sell.',
-        );
-        const sold = await this.pumpTrader.sellPumpSwap(result.position, result.tokensOut);
-        logger.info({ mint, sold }, 'DRY_RUN simulated sell');
+      if (this.positionMonitor && this.config.autoSell) {
+        const tokenProgram = result.position.tokenIsBase ? result.position.baseTokenProgram : result.position.quoteTokenProgram;
+        await this.positionMonitor.onBuy({
+          mint: result.position.mint,
+          tokenProgram,
+          tokens: result.tokensOut,
+          solIn: result.solIn ?? BigInt(this.config.quoteAmount.raw.toString()),
+          swap: result.position,
+        });
       }
     } catch (error) {
       logger.error({ mint, error }, 'Failed to buy PumpSwap token');
