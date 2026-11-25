@@ -39,6 +39,22 @@ export function quoteBondingCurveBuy(
   return ((net - 1n) * virtualTokenReserves) / (virtualQuoteReserves + net - 1n);
 }
 
+/** Largest raw sell whose gross quote out does not exceed the SOL actually in the curve. */
+export function maxPayableSellAmount(virtualToken: bigint, virtualQuote: bigint, realQuote: bigint): bigint {
+  if (virtualToken <= 0n || virtualQuote <= 0n || realQuote <= 0n) {
+    return 0n;
+  }
+  if (virtualQuote <= realQuote) {
+    return virtualToken;
+  }
+  const amount = (realQuote * virtualToken) / (virtualQuote - realQuote);
+  if (amount <= 1n) {
+    return amount;
+  }
+  const gross = (amount * virtualQuote) / (virtualToken + amount);
+  return gross > realQuote ? amount - 1n : amount;
+}
+
 /** Tokens → quote. Fees are taken out of the constant-product output. */
 export function quoteBondingCurveSell(
   tokenAmountIn: bigint,

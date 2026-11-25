@@ -6,7 +6,7 @@
   "scripts": {
     "start": "ts-node index.ts",
     "tsc": "tsc --noEmit",
-    "test": "ts-node --transpile-only test/exit.test.ts && ts-node --transpile-only test/quality.test.ts && ts-node --transpile-only test/rpc.test.ts && ts-node --transpile-only test/quality-live.test.ts && ts-node --transpile-only test/audit.test.ts"
+    "test": "ts-node --transpile-only test/exit.test.ts && ts-node --transpile-only test/quality.test.ts && ts-node --transpile-only test/rpc.test.ts && ts-node --transpile-only test/sell-sim.test.ts && ts-node --transpile-only test/quality-live.test.ts && ts-node --transpile-only test/audit.test.ts"
   },
   "dependencies": {
     "@metaplex-foundation/mpl-token-metadata": "^3.2.1",

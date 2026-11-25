@@ -9,11 +9,11 @@ import {
 import {
   createAssociatedTokenAccountIdempotentInstruction,
   createCloseAccountInstruction,
-  getAccount,
   getAssociatedTokenAddress,
   RawAccount,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
+  NATIVE_MINT,
 } from '@solana/spl-token';
 import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
@@ -26,6 +26,7 @@ import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
 import { TOKEN_ACCOUNT_RENT_LAMPORTS } from './pump/constants';
+import { closeBaseAtaIx, wrapSolIxs } from './pump/instructions';
 import { CreatePoolEvent, PumpCreateEvent } from './pump/events';
 import { PumpFilterConfig } from './pump/filters';
 import { PositionBook } from './pump/positions';
@@ -161,6 +162,7 @@ export class Bot {
     graceMs: number;
     confirmations: number;
     sellRetryIntervalMs: number;
+    pnlLogIntervalMs: number;
     useWebsocket: boolean;
   }) {
     this.positionMonitor = new PositionMonitor(this.connection, this.pumpTrader, this.config.wallet.publicKey, config);
@@ -181,25 +183,13 @@ export class Bot {
       return true;
     }
 
-    if (this.config.enableRaydium) {
-      try {
-        await getAccount(this.connection, this.config.quoteAta, this.connection.commitment);
-      } catch (error) {
-        logger.error(
-          `${this.config.quoteToken.symbol} token account not found in wallet: ${this.config.wallet.publicKey.toString()}`,
-        );
-        return false;
-      }
-    }
-
-    if (this.config.enablePumpfun || this.config.enablePumpswap) {
-      const balance = BigInt(await this.connection.getBalance(this.config.wallet.publicKey, this.connection.commitment));
-      if (balance < quoteAtoms + 6_000_000n) {
-        logger.error(
-          `Wallet SOL balance is below the buy size plus about 0.006 SOL for the token account, pump volume account, and fees. Need ${quoteAtoms + 6_000_000n} lamports, have ${balance}.`,
-        );
-        return false;
-      }
+    const balance = BigInt(await this.connection.getBalance(this.config.wallet.publicKey, this.connection.commitment));
+    const needed = quoteAtoms + 6_000_000n;
+    if (balance < needed) {
+      logger.error(
+        `Wallet SOL balance is below the buy size plus about 0.006 SOL for account rent and fees. Need ${needed} lamports, have ${balance}. SOL is wrapped inside the swap when a venue needs WSOL.`,
+      );
+      return false;
     }
 
     return true;
@@ -462,6 +452,7 @@ export class Bot {
       poolKeys.version,
     );
 
+    const spendsSol = this.config.quoteToken.mint.equals(NATIVE_MINT);
     const messageV0 = new TransactionMessage({
       payerKey: wallet.publicKey,
       recentBlockhash: latestBlockhash.blockhash,
@@ -482,7 +473,19 @@ export class Bot {
               ),
             ]
           : []),
+        ...(spendsSol && direction === 'buy' ? wrapSolIxs(wallet.publicKey, BigInt(amountIn.raw.toString())) : []),
+        ...(spendsSol && direction === 'sell'
+          ? [
+              createAssociatedTokenAccountIdempotentInstruction(
+                wallet.publicKey,
+                ataOut,
+                wallet.publicKey,
+                NATIVE_MINT,
+              ),
+            ]
+          : []),
         ...innerTransaction.instructions,
+        ...(spendsSol ? [closeBaseAtaIx(NATIVE_MINT, wallet.publicKey, TOKEN_PROGRAM_ID)] : []),
         ...(direction === 'sell' && includeClose
           ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey, [], tokenProgramId)]
           : []),

@@ -7,12 +7,12 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
-import { getAccount, getAssociatedTokenAddressSync, MintLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { getAssociatedTokenAddressSync, MintLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { logger } from '../helpers/logger';
 import { sleep } from '../helpers/promises';
 import { watchAccountUntil } from '../helpers/price-watch';
 import { TransactionExecutor } from '../transactions';
-import { buyFailureShouldStop } from '../transactions/tx-error';
+import { buyFailureShouldStop, sellFailureClass } from '../transactions/tx-error';
 import {
   BONDING_CURVE_CREATOR_FEE_BPS,
   BONDING_CURVE_PROTOCOL_FEE_BPS,
@@ -46,6 +46,7 @@ import {
   higherFee,
   lamportsToSol,
   marketCapLamports,
+  maxPayableSellAmount,
   quoteBondingCurveBuy,
   quoteBondingCurveSell,
   quotePumpSwapBuy,
@@ -450,7 +451,6 @@ export class PumpTrader {
       return null;
     }
     this.positions.set(position);
-    const deficit = await this.wrapDeficit(this.config.quoteLamports);
     const tokenProgram = position.tokenIsBase ? position.baseTokenProgram : position.quoteTokenProgram;
     const attempt = await this.execute(mint, 'buy', async (slippage) => {
       const live = await this.poolReserves(
@@ -494,8 +494,9 @@ export class PumpTrader {
       return this.compile([
         ...this.priorityFeeIxs(),
         createBaseAtaIx(this.config.wallet.publicKey, position.mint, this.config.wallet.publicKey, tokenProgram),
-        ...wrapSolIxs(this.config.wallet.publicKey, deficit),
+        ...wrapSolIxs(this.config.wallet.publicKey, this.config.quoteLamports),
         trade,
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
       ]);
     });
 
@@ -516,7 +517,6 @@ export class PumpTrader {
     if (amount <= 0n) {
       return false;
     }
-
     const curveNow = await this.readCurve(position.mint);
     if (curveNow?.complete) {
       logger.info({ mint: position.mint.toBase58() }, 'Bonding curve is complete. Trying the canonical PumpSwap pool.');
@@ -524,13 +524,11 @@ export class PumpTrader {
       if (!migrated) {
         return false;
       }
-      return this.sellPumpSwap(migrated, amount);
+      return this.sellPumpSwap(migrated, amount, options);
     }
-
-    if (this.config.autoSellDelay > 0) {
+    if (this.config.autoSellDelay > 0 && !options?.skipWatch) {
       await sleep(this.config.autoSellDelay);
     }
-
     const global = await this.loadPumpGlobal();
     const protocolFeeBps = this.saneBps(global?.feeBasisPoints ?? 0n, BONDING_CURVE_PROTOCOL_FEE_BPS);
     const creatorFeeBps = this.saneBps(
@@ -542,50 +540,86 @@ export class PumpTrader {
       logger.error({ mint: position.mint.toBase58() }, 'Pump Global has no buyback fee recipient. Sell was not sent.');
       return false;
     }
-
     if (!options?.skipWatch) {
       await this.holdForExit(position.bondingCurve, async () => {
         const live = await this.readCurve(position.mint);
         if (!live) {
           throw new Error('bonding curve missing');
         }
-        return quoteBondingCurveSell(amount, live.virtualTokenReserves, live.virtualQuoteReserves, protocolFeeBps, creatorFeeBps);
+        const balance = await this.tokenBalance(position.mint, this.config.wallet.publicKey, position.baseTokenProgram);
+        const selling = balance > 0n ? balance : amount;
+        return quoteBondingCurveSell(selling, live.virtualTokenReserves, live.virtualQuoteReserves, protocolFeeBps, creatorFeeBps);
       });
     }
-
-    const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
+    const cleared = await this.drainBalance(position.mint, position.baseTokenProgram, async (balance, slippage) => {
       const live = await this.readCurve(position.mint);
-      const quoted = live
-        ? quoteBondingCurveSell(amount, live.virtualTokenReserves, live.virtualQuoteReserves, protocolFeeBps, creatorFeeBps)
-        : 0n;
-      if (quoted <= 0n && slippage < 100) {
-        throw new Error('bonding curve quote unavailable');
+      if (!live) {
+        return null;
       }
-      const includeClose = this.config.closeEmptyTokenAccounts && attempt < max - 2;
-      return this.compile([
-        ...this.priorityFeeIxs(),
-        pumpSellIx({
-          user: this.config.wallet.publicKey,
-          mint: position.mint,
-          baseTokenProgram: position.baseTokenProgram,
-          amount,
-          minQuoteOut: applySlippage(quoted, slippage),
-          buybackFeeRecipient: recipient,
-        }),
-        ...(includeClose ? [closeBaseAtaIx(position.mint, this.config.wallet.publicKey, position.baseTokenProgram)] : []),
-      ]);
+      if (live.complete) {
+        return 'migrated';
+      }
+      const payable = maxPayableSellAmount(live.virtualTokenReserves, live.virtualQuoteReserves, live.realQuoteReserves);
+      const selling = payable < balance ? payable : balance;
+      if (selling <= 0n) {
+        logger.error(
+          { mint: position.mint.toBase58(), balance: balance.toString(), realSol: live.realQuoteReserves.toString() },
+          'The curve does not hold enough SOL to pay for any of this balance. Sell was not sent.',
+        );
+        return null;
+      }
+      if (selling < balance) {
+        logger.info(
+          {
+            mint: position.mint.toBase58(),
+            balance: balance.toString(),
+            selling: selling.toString(),
+            realSol: live.realQuoteReserves.toString(),
+          },
+          'Selling the most the curve can pay in one SellV3. The rest stays until the curve holds more SOL.',
+        );
+      }
+      const quoted = quoteBondingCurveSell(
+        selling,
+        live.virtualTokenReserves,
+        live.virtualQuoteReserves,
+        protocolFeeBps,
+        creatorFeeBps,
+      );
+      return {
+        instructions: [
+          pumpSellIx({
+            user: this.config.wallet.publicKey,
+            mint: position.mint,
+            baseTokenProgram: position.baseTokenProgram,
+            amount: selling,
+            minQuoteOut: applySlippage(quoted, slippage),
+            buybackFeeRecipient: recipient,
+          }),
+        ],
+        covered: selling,
+        close: selling >= balance,
+      };
     });
-    if (sold.ok) {
+    if (cleared === 'migrated') {
+      const migrated = await this.positionFromCanonicalPool(position);
+      if (!migrated) {
+        return false;
+      }
+      const left = await this.tokenBalance(position.mint, this.config.wallet.publicKey, position.baseTokenProgram);
+      return this.sellPumpSwap(migrated, left > 0n ? left : amount, { skipWatch: true });
+    }
+    if (cleared) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold.ok;
+    return cleared === true;
   }
 
   async sellPumpSwap(position: PumpSwapPosition, amount: bigint, options?: { skipWatch?: boolean }): Promise<boolean> {
     if (amount <= 0n) {
       return false;
     }
-    if (this.config.autoSellDelay > 0) {
+    if (this.config.autoSellDelay > 0 && !options?.skipWatch) {
       await sleep(this.config.autoSellDelay);
     }
 
@@ -609,19 +643,19 @@ export class PumpTrader {
       });
     }
 
-    const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
+    const tokenProgram = position.baseTokenProgram;
+    const cleared = await this.drainBalance(position.mint, tokenProgram, async (balance, slippage) => {
       const reserves = await this.poolReserves(
         position.poolBaseTokenAccount,
         position.poolQuoteTokenAccount,
         position.virtualQuoteReserves,
       );
-      const quoted = reserves ? quotePumpSwapSell(amount, reserves.base, reserves.quote, feeBps) : 0n;
-      if (quoted <= 0n && slippage < 100) {
-        throw new Error('PumpSwap quote unavailable');
+      if (!reserves) {
+        return null;
       }
-      const includeClose = this.config.closeEmptyTokenAccounts && attempt < max - 2;
-      return this.compile([
-        ...this.priorityFeeIxs(),
+      const quoted = quotePumpSwapSell(balance, reserves.base, reserves.quote, feeBps);
+      const sells = [
+        createBaseAtaIx(this.config.wallet.publicKey, NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
         pumpSwapSellIx({
           user: this.config.wallet.publicKey,
           pool: position.pool,
@@ -631,17 +665,18 @@ export class PumpTrader {
           poolQuote: position.poolQuoteTokenAccount,
           baseTokenProgram: position.baseTokenProgram,
           quoteTokenProgram: position.quoteTokenProgram,
-          baseAmountIn: amount,
+          baseAmountIn: balance,
           minQuoteOut: applySlippage(quoted, slippage),
           buybackQuoteAta: buybackAta,
         }),
-        ...(includeClose ? [closeBaseAtaIx(position.mint, this.config.wallet.publicKey, position.baseTokenProgram)] : []),
-      ]);
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
+      ];
+      return { instructions: sells, covered: balance, close: true };
     });
-    if (sold.ok) {
+    if (cleared === true) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold.ok;
+    return cleared === true;
   }
 
   /** SOL is the pool base and the token is the quote. Spend the token to receive SOL. */
@@ -666,19 +701,18 @@ export class PumpTrader {
     });
     }
 
-    const sold = await this.execute(position.mint.toBase58(), 'sell', async (slippage, attempt, max) => {
+    const cleared = await this.drainBalance(position.mint, position.quoteTokenProgram, async (balance, slippage) => {
       const reserves = await this.poolReserves(
         position.poolBaseTokenAccount,
         position.poolQuoteTokenAccount,
         position.virtualQuoteReserves,
       );
-      const quoted = reserves ? quotePumpSwapBuy(amount, reserves.base, reserves.quote, feeBps) : 0n;
-      if (quoted <= 0n && slippage < 100) {
-        throw new Error('PumpSwap quote unavailable');
+      if (!reserves) {
+        return null;
       }
-      const includeClose = this.config.closeEmptyTokenAccounts && attempt < max - 2;
-      return this.compile([
-        ...this.priorityFeeIxs(),
+      const quoted = quotePumpSwapBuy(balance, reserves.base, reserves.quote, feeBps);
+      const sells = [
+        createBaseAtaIx(this.config.wallet.publicKey, NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
         pumpSwapBuyIx({
           user: this.config.wallet.publicKey,
           pool: position.pool,
@@ -688,19 +722,18 @@ export class PumpTrader {
           poolQuote: position.poolQuoteTokenAccount,
           baseTokenProgram: position.baseTokenProgram,
           quoteTokenProgram: position.quoteTokenProgram,
-          spendableQuoteIn: amount,
+          spendableQuoteIn: balance,
           minBaseOut: applySlippage(quoted, slippage),
           buybackQuoteAta: buybackAta,
         }),
-        ...(includeClose
-          ? [closeBaseAtaIx(position.mint, this.config.wallet.publicKey, position.quoteTokenProgram)]
-          : []),
-      ]);
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
+      ];
+      return { instructions: sells, covered: balance, close: true };
     });
-    if (sold.ok) {
+    if (cleared === true) {
       this.positions.delete(position.mint.toBase58());
     }
-    return sold.ok;
+    return cleared === true;
   }
 
   private async positionFromCanonicalPool(position: PumpPosition): Promise<PumpSwapPosition | null> {
@@ -726,6 +759,87 @@ export class PumpTrader {
       virtualQuoteReserves: pool.virtualQuoteReserves > 0n ? pool.virtualQuoteReserves : 0n,
       tokenIsBase: orientSolPair(pool.baseMint, pool.quoteMint)?.tokenIsBase ?? true,
     };
+  }
+
+  private async drainBalance(
+    mint: PublicKey,
+    tokenProgram: PublicKey,
+    plan: (
+      balance: bigint,
+      slippage: number,
+    ) => Promise<{ instructions: TransactionInstruction[]; covered: bigint; close: boolean } | 'migrated' | null>,
+  ): Promise<boolean | 'migrated'> {
+    const mintText = mint.toBase58();
+    let slippage = this.config.sellSlippage;
+    let failures = 0;
+    const max = Math.max(1, this.config.maxSellRetries);
+    while (failures < max) {
+      const balance = await this.tokenBalance(mint, this.config.wallet.publicKey, tokenProgram);
+      if (balance <= 0n) {
+        return true;
+      }
+      const planned = await plan(balance, slippage);
+      if (planned === 'migrated') {
+        return 'migrated';
+      }
+      if (!planned) {
+        logger.error({ mint: mintText }, 'Sell quote is unavailable. The balance was left in the wallet.');
+        return false;
+      }
+      const units = Math.min(1_400_000, 60_000 * planned.instructions.length + 40_000);
+      const built = await this.compile([
+        ...this.priorityFeeIxs(units),
+        ...planned.instructions,
+        ...(planned.close && this.config.closeEmptyTokenAccounts
+          ? [closeBaseAtaIx(mint, this.config.wallet.publicKey, tokenProgram)]
+          : []),
+      ]);
+      logger.info(
+        { mint: mintText, tokens: planned.covered.toString(), slippage, chunks: planned.instructions.length },
+        `Send sell transaction (${failures + 1}/${max})`,
+      );
+      const result = await this.txExecutor.executeAndConfirm(built.transaction, this.config.wallet, built.blockhash);
+      if (result.confirmed) {
+        if (this.config.dryRun) {
+          logger.info({ mint: mintText, signature: result.signature }, 'DRY_RUN sell simulated. Nothing was broadcast.');
+          return true;
+        }
+        const left = await this.tokenBalance(mint, this.config.wallet.publicKey, tokenProgram);
+        if (left <= 0n) {
+          logger.info({ mint: mintText, signature: result.signature }, 'Confirmed sell tx');
+          return true;
+        }
+        logger.info(
+          { mint: mintText, signature: result.signature, remaining: left.toString() },
+          'Sell landed. Reading the balance again for the next chunk.',
+        );
+        slippage = this.config.sellSlippage;
+        failures = 0;
+        continue;
+      }
+      logger.error(
+        { mint: mintText, signature: result.signature, error: result.error, attempt: failures + 1, max },
+        'sell attempt failed',
+      );
+      const klass = sellFailureClass(result.error);
+      if (klass === 'slippage') {
+        const next = Math.min(100, slippage + Math.max(0, this.config.sellSlippageStep));
+        logger.info({ mint: mintText, slippage: next }, 'Sell missed the minimum output. Requoting with wider slippage.');
+        slippage = next;
+        failures += 1;
+        continue;
+      }
+      if (klass === 'fatal') {
+        logger.error(
+          { mint: mintText, error: result.error },
+          'Sell failed with a program error. It will not be sent again unchanged.',
+        );
+        return false;
+      }
+      failures += 1;
+    }
+    const left = await this.tokenBalance(mint, this.config.wallet.publicKey, tokenProgram);
+    return left <= 0n;
   }
 
   private async holdForExit(account: PublicKey, currentOut: () => Promise<bigint>) {
@@ -782,7 +896,8 @@ export class PumpTrader {
         const stop =
           result.retryable === false ||
           /insufficient lamports|insufficient funds/i.test(result.error || '') ||
-          (direction === 'buy' && buyFailureShouldStop(result.error));
+          (direction === 'buy' && buyFailureShouldStop(result.error)) ||
+          (direction === 'sell' && sellFailureClass(result.error) === 'fatal');
         if (stop) {
           return { ok: false, signature: result.signature };
         }
@@ -805,8 +920,7 @@ export class PumpTrader {
     return { transaction, blockhash };
   }
 
-  private priorityFeeIxs() {
-    const units = Math.max(this.config.unitLimit, 250_000);
+  private priorityFeeIxs(units = Math.max(this.config.unitLimit, 250_000)) {
     return [
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
       ComputeBudgetProgram.setComputeUnitLimit({ units }),
@@ -910,16 +1024,6 @@ export class PumpTrader {
       return BigInt(balance.value.amount);
     } catch {
       return 0n;
-    }
-  }
-
-  private async wrapDeficit(required: bigint): Promise<bigint> {
-    try {
-      const ata = getAssociatedTokenAddressSync(NATIVE_MINT, this.config.wallet.publicKey, false, TOKEN_PROGRAM_ID);
-      const account = await getAccount(this.connection, ata, this.connection.commitment);
-      return account.amount >= required ? 0n : required - account.amount;
-    } catch {
-      return required;
     }
   }
 
