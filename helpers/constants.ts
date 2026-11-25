@@ -1,5 +1,6 @@
 import { Logger } from 'pino'; 
 import dotenv from 'dotenv';
+import fs from 'fs';
 import { Commitment } from '@solana/web3.js';
 import { logger } from './logger';
 
@@ -19,7 +20,15 @@ const envBool = (name: string, fallback: boolean) => {
   if (value === undefined || value.trim() === '') {
     return fallback;
   }
-  return value.trim().toLowerCase() === 'true';
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') {
+    return true;
+  }
+  if (normalized === 'false') {
+    return false;
+  }
+  logger.error(`${name} must be true or false, got "${value.trim()}"`);
+  process.exit(1);
 };
 
 const envNum = (name: string, fallback: number) => {
@@ -28,7 +37,11 @@ const envNum = (name: string, fallback: number) => {
     return fallback;
   }
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  if (!Number.isFinite(parsed)) {
+    logger.error(`${name} must be a number, got "${value.trim()}"`);
+    process.exit(1);
+  }
+  return parsed;
 };
 
 const envStr = (name: string, fallback: string) => {
@@ -60,7 +73,7 @@ export const CUSTOM_FEE = retrieveEnvVariable('CUSTOM_FEE', logger);
 
 // Buy
 export const AUTO_BUY_DELAY = Number(retrieveEnvVariable('AUTO_BUY_DELAY', logger));
-export const QUOTE_MINT = retrieveEnvVariable('QUOTE_MINT', logger);
+export const QUOTE_MINT = envStr('QUOTE_MINT', 'WSOL');
 export const QUOTE_AMOUNT = retrieveEnvVariable('QUOTE_AMOUNT', logger);
 export const MAX_BUY_RETRIES = Number(retrieveEnvVariable('MAX_BUY_RETRIES', logger));
 export const BUY_SLIPPAGE = Number(retrieveEnvVariable('BUY_SLIPPAGE', logger));
@@ -156,3 +169,186 @@ export const RUGCHECK_ENABLED = envBool('RUGCHECK_ENABLED', false);
 export const RUGCHECK_MAX_SCORE = envNum('RUGCHECK_MAX_SCORE', 1000);
 export const RUGCHECK_TIMEOUT_MS = envNum('RUGCHECK_TIMEOUT_MS', 8000);
 export const RUGCHECK_FAIL_OPEN = envBool('RUGCHECK_FAIL_OPEN', true);
+
+const KNOWN_SETTINGS = new Set([
+  'PRIVATE_KEY',
+  'COMMITMENT_LEVEL',
+  'RPC_ENDPOINT',
+  'RPC_WEBSOCKET_ENDPOINT',
+  'SEND_RPC_ENDPOINT',
+  'LOG_LEVEL',
+  'ONE_TOKEN_AT_A_TIME',
+  'COMPUTE_UNIT_LIMIT',
+  'COMPUTE_UNIT_PRICE',
+  'PRE_LOAD_EXISTING_MARKETS',
+  'CACHE_NEW_MARKETS',
+  'TRANSACTION_EXECUTOR',
+  'CUSTOM_FEE',
+  'AUTO_BUY_DELAY',
+  'QUOTE_MINT',
+  'QUOTE_AMOUNT',
+  'MAX_BUY_RETRIES',
+  'BUY_SLIPPAGE',
+  'AUTO_SELL',
+  'AUTO_SELL_DELAY',
+  'MAX_SELL_RETRIES',
+  'TAKE_PROFIT',
+  'STOP_LOSS',
+  'PRICE_CHECK_INTERVAL',
+  'PRICE_CHECK_DURATION',
+  'SELL_SLIPPAGE',
+  'FILTER_CHECK_INTERVAL',
+  'FILTER_CHECK_DURATION',
+  'CONSECUTIVE_FILTER_MATCHES',
+  'CHECK_IF_MUTABLE',
+  'CHECK_IF_SOCIALS',
+  'CHECK_IF_MINT_IS_RENOUNCED',
+  'CHECK_IF_FREEZABLE',
+  'CHECK_IF_BURNED',
+  'MIN_POOL_SIZE',
+  'MAX_POOL_SIZE',
+  'USE_SNIPE_LIST',
+  'SNIPE_LIST_REFRESH_INTERVAL',
+  'DRY_RUN',
+  'ENABLE_RAYDIUM',
+  'ENABLE_PUMPFUN',
+  'ENABLE_PUMPSWAP',
+  'CLOSE_EMPTY_TOKEN_ACCOUNTS',
+  'PRICE_CHECK_WEBSOCKET',
+  'RETRY_BACKOFF_MS',
+  'SELL_SLIPPAGE_STEP',
+  'PUMP_MIN_CURVE_PROGRESS',
+  'PUMP_MAX_CURVE_PROGRESS',
+  'PUMP_MIN_MARKET_CAP_SOL',
+  'PUMP_MAX_MARKET_CAP_SOL',
+  'PUMP_MIN_DEV_BUY_SOL',
+  'PUMP_MAX_DEV_BUY_SOL',
+  'PUMP_MAX_CREATOR_HOLD_PERCENT',
+  'PUMP_MIN_UNIQUE_BUYERS',
+  'PUMP_BUYER_WAIT_MS',
+  'PUMP_MAX_REAL_SOL',
+  'PUMP_SKIP_MAYHEM',
+  'PUMP_CHECK_IF_MUTABLE',
+  'PUMP_ALLOW_NON_SOL_QUOTE',
+  'PUMP_CREATOR_BLACKLIST',
+  'SL_CONFIRMATIONS',
+  'SL_GRACE_MS',
+  'SELL_RETRY_INTERVAL_MS',
+  'PNL_LOG_INTERVAL_MS',
+  'RPC_MIN_INTERVAL_MS',
+  'RPC_MAX_CONCURRENCY',
+  'RPC_HEAVY_INTERVAL_MS',
+  'RPC_SEND_INTERVAL_MS',
+  'RPC_RETRY_ATTEMPTS',
+  'RPC_RETRY_BUDGET_MS',
+  'QUALITY_FILTERS',
+  'QUALITY_CHECK_SELLABLE',
+  'MAX_TRANSFER_FEE_BPS',
+  'MAX_SINGLE_HOLDER_PCT',
+  'MAX_TOP10_PCT',
+  'MAX_DEV_BUY_PCT',
+  'MAX_CREATOR_LAUNCHES',
+  'QUALITY_WAIT_MS',
+  'QUALITY_MIN_TRADES',
+  'QUALITY_MIN_UNIQUE_BUYERS',
+  'QUALITY_MIN_BUY_SELL_RATIO',
+  'QUALITY_MAX_SAME_SLOT_BUYS',
+  'QUALITY_MIN_REAL_SOL',
+  'RUGCHECK_ENABLED',
+  'RUGCHECK_MAX_SCORE',
+  'RUGCHECK_TIMEOUT_MS',
+  'RUGCHECK_FAIL_OPEN',
+]);
+
+function failSetting(message: string): never {
+  logger.error(message);
+  process.exit(1);
+}
+
+function requireChoice(name: string, value: string, allowed: string[]) {
+  if (!allowed.includes(value)) {
+    failSetting(`${name} must be one of ${allowed.join(', ')}, got "${value}"`);
+  }
+}
+
+function requireRange(name: string, value: number, min: number, max: number) {
+  if (!Number.isFinite(value) || value < min || value > max) {
+    failSetting(`${name} must be a number from ${min} to ${max}, got "${process.env[name]}"`);
+  }
+}
+
+function warnUnknownSettings() {
+  if (!fs.existsSync('.env')) {
+    return;
+  }
+  const text = fs.readFileSync('.env', 'utf8');
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    if (!KNOWN_SETTINGS.has(key)) {
+      logger.warn(`${key} is not a setting this bot reads. It is ignored.`);
+    }
+  }
+}
+
+requireChoice('COMMITMENT_LEVEL', COMMITMENT_LEVEL, ['processed', 'confirmed', 'finalized']);
+requireChoice('LOG_LEVEL', LOG_LEVEL, ['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+requireChoice('TRANSACTION_EXECUTOR', TRANSACTION_EXECUTOR, ['default', 'warp', 'jito']);
+requireChoice('QUOTE_MINT', QUOTE_MINT, ['WSOL', 'USDC']);
+requireRange('BUY_SLIPPAGE', BUY_SLIPPAGE, 0, 100);
+requireRange('SELL_SLIPPAGE', SELL_SLIPPAGE, 0, 100);
+requireRange('SELL_SLIPPAGE_STEP', SELL_SLIPPAGE_STEP, 0, 100);
+requireRange('TAKE_PROFIT', TAKE_PROFIT, 0, 100000);
+requireRange('STOP_LOSS', STOP_LOSS, 0, 100);
+if (!Number.isFinite(COMPUTE_UNIT_LIMIT) || COMPUTE_UNIT_LIMIT <= 0) {
+  failSetting('COMPUTE_UNIT_LIMIT must be a positive number');
+}
+if (!Number.isFinite(COMPUTE_UNIT_PRICE) || COMPUTE_UNIT_PRICE < 0) {
+  failSetting('COMPUTE_UNIT_PRICE must be a number that is zero or greater');
+}
+if (!Number.isFinite(Number(QUOTE_AMOUNT)) || Number(QUOTE_AMOUNT) <= 0) {
+  failSetting('QUOTE_AMOUNT must be a positive number');
+}
+for (const name of [
+  'ONE_TOKEN_AT_A_TIME',
+  'PRE_LOAD_EXISTING_MARKETS',
+  'CACHE_NEW_MARKETS',
+  'AUTO_SELL',
+  'CHECK_IF_MUTABLE',
+  'CHECK_IF_SOCIALS',
+  'CHECK_IF_MINT_IS_RENOUNCED',
+  'CHECK_IF_FREEZABLE',
+  'CHECK_IF_BURNED',
+  'USE_SNIPE_LIST',
+]) {
+  const value = (process.env[name] ?? '').trim().toLowerCase();
+  if (value !== 'true' && value !== 'false') {
+    failSetting(`${name} must be true or false, got "${process.env[name]}"`);
+  }
+}
+for (const [name, value] of [
+  ['AUTO_BUY_DELAY', AUTO_BUY_DELAY],
+  ['MAX_BUY_RETRIES', MAX_BUY_RETRIES],
+  ['AUTO_SELL_DELAY', AUTO_SELL_DELAY],
+  ['MAX_SELL_RETRIES', MAX_SELL_RETRIES],
+  ['PRICE_CHECK_INTERVAL', PRICE_CHECK_INTERVAL],
+  ['PRICE_CHECK_DURATION', PRICE_CHECK_DURATION],
+  ['FILTER_CHECK_INTERVAL', FILTER_CHECK_INTERVAL],
+  ['FILTER_CHECK_DURATION', FILTER_CHECK_DURATION],
+  ['CONSECUTIVE_FILTER_MATCHES', CONSECUTIVE_FILTER_MATCHES],
+  ['SNIPE_LIST_REFRESH_INTERVAL', SNIPE_LIST_REFRESH_INTERVAL],
+  ['MIN_POOL_SIZE', Number(MIN_POOL_SIZE)],
+  ['MAX_POOL_SIZE', Number(MAX_POOL_SIZE)],
+] as const) {
+  if (!Number.isFinite(value) || value < 0) {
+    failSetting(`${name} must be a number that is zero or greater`);
+  }
+}
+warnUnknownSettings();

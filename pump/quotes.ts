@@ -39,34 +39,20 @@ export function quoteBondingCurveBuy(
   return ((net - 1n) * virtualTokenReserves) / (virtualQuoteReserves + net - 1n);
 }
 
-const U64_MAX = (1n << 64n) - 1n;
-
-/**
- * Largest raw token amount whose product with the quote reserve fits in a u64.
- * SellV3 does `amount * virtual_quote_reserves` with checked_mul and returns
- * Overflow (6024) when that product exceeds u64::MAX.
- */
-export function maxSafeSellAmount(quoteReserve: bigint): bigint {
-  if (quoteReserve <= 0n) {
+/** Largest raw sell whose gross quote out does not exceed the SOL actually in the curve. */
+export function maxPayableSellAmount(virtualToken: bigint, virtualQuote: bigint, realQuote: bigint): bigint {
+  if (virtualToken <= 0n || virtualQuote <= 0n || realQuote <= 0n) {
     return 0n;
   }
-  const cap = U64_MAX / quoteReserve;
-  return cap > 1n ? cap - 1n : cap;
-}
-
-/** Split a balance into sells that stay under the u64 multiply cap. */
-export function sellChunkAmounts(balance: bigint, cap: bigint, maxChunks: number): bigint[] {
-  if (balance <= 0n || cap <= 0n || maxChunks <= 0) {
-    return [];
+  if (virtualQuote <= realQuote) {
+    return virtualToken;
   }
-  const chunks: bigint[] = [];
-  let left = balance;
-  while (left > 0n && chunks.length < maxChunks) {
-    const size = left > cap ? cap : left;
-    chunks.push(size);
-    left -= size;
+  const amount = (realQuote * virtualToken) / (virtualQuote - realQuote);
+  if (amount <= 1n) {
+    return amount;
   }
-  return chunks;
+  const gross = (amount * virtualQuote) / (virtualToken + amount);
+  return gross > realQuote ? amount - 1n : amount;
 }
 
 /** Tokens → quote. Fees are taken out of the constant-product output. */

@@ -1,7 +1,7 @@
 import assert from 'assert';
 import { evaluateExit, pnlBps } from '../pump/exit';
 import { buyFailureShouldStop } from '../transactions/tx-error';
-import { maxSafeSellAmount, quoteBondingCurveSell, sellChunkAmounts } from '../pump/quotes';
+import { maxPayableSellAmount, quoteBondingCurveSell } from '../pump/quotes';
 import { sellFailureClass } from '../transactions/tx-error';
 import { serializeLogError } from '../helpers/logger';
 
@@ -36,13 +36,10 @@ assert.strictEqual(buyFailureShouldStop('blockhash expired at height 10'), false
 const mark = quoteBondingCurveSell(299674225407n, 1_000_000_000_000_000n, 30_000_000_000n, 95n, 30n);
 assert.ok(mark > 0n);
 
-const virtualSol = 128_510_536_696n;
-const cap = maxSafeSellAmount(virtualSol);
-assert.ok(cap > 0n);
-assert.ok(cap * virtualSol <= (1n << 64n) - 1n);
-assert.ok((cap + 2n) * virtualSol > (1n << 64n) - 1n);
-const chunks = sellChunkAmounts(cap * 3n + 10n, cap, 20);
-assert.deepStrictEqual(chunks, [cap, cap, cap, 10n]);
+const pay = maxPayableSellAmount(1_001_093_440_102_351n, 128_510_536_696n, 19_897_463n);
+const gross = (pay * 128_510_536_696n) / (1_001_093_440_102_351n + pay);
+assert.ok(gross <= 19_897_463n);
+assert.ok(pay > 100_000_000_000n);
 assert.strictEqual(sellFailureClass('simulation failed: {"InstructionError":[2,{"Custom":6024}]} | Overflow'), 'retry');
 assert.strictEqual(sellFailureClass('TooLittleSolReceived'), 'slippage');
 assert.strictEqual(sellFailureClass('custom program error: 0x1788'), 'retry');

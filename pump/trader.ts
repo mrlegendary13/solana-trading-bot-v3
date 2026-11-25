@@ -7,7 +7,7 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
-import { getAccount, getAssociatedTokenAddressSync, MintLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { getAssociatedTokenAddressSync, MintLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { logger } from '../helpers/logger';
 import { sleep } from '../helpers/promises';
 import { watchAccountUntil } from '../helpers/price-watch';
@@ -46,12 +46,11 @@ import {
   higherFee,
   lamportsToSol,
   marketCapLamports,
-  maxSafeSellAmount,
+  maxPayableSellAmount,
   quoteBondingCurveBuy,
   quoteBondingCurveSell,
   quotePumpSwapBuy,
   quotePumpSwapSell,
-  sellChunkAmounts,
   sellSlippageForAttempt,
 } from './quotes';
 import { QualityConfig, checkTokenQuality } from './quality';
@@ -452,7 +451,6 @@ export class PumpTrader {
       return null;
     }
     this.positions.set(position);
-    const deficit = await this.wrapDeficit(this.config.quoteLamports);
     const tokenProgram = position.tokenIsBase ? position.baseTokenProgram : position.quoteTokenProgram;
     const attempt = await this.execute(mint, 'buy', async (slippage) => {
       const live = await this.poolReserves(
@@ -496,8 +494,9 @@ export class PumpTrader {
       return this.compile([
         ...this.priorityFeeIxs(),
         createBaseAtaIx(this.config.wallet.publicKey, position.mint, this.config.wallet.publicKey, tokenProgram),
-        ...wrapSolIxs(this.config.wallet.publicKey, deficit),
+        ...wrapSolIxs(this.config.wallet.publicKey, this.config.quoteLamports),
         trade,
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
       ]);
     });
 
@@ -560,38 +559,46 @@ export class PumpTrader {
       if (live.complete) {
         return 'migrated';
       }
-      const cap = maxSafeSellAmount(live.virtualQuoteReserves);
-      const chunks = sellChunkAmounts(balance, cap, 20);
-      if (chunks.length === 0) {
+      const payable = maxPayableSellAmount(live.virtualTokenReserves, live.virtualQuoteReserves, live.realQuoteReserves);
+      const selling = payable < balance ? payable : balance;
+      if (selling <= 0n) {
+        logger.error(
+          { mint: position.mint.toBase58(), balance: balance.toString(), realSol: live.realQuoteReserves.toString() },
+          'The curve does not hold enough SOL to pay for any of this balance. Sell was not sent.',
+        );
         return null;
       }
-      if (chunks.length > 1 || chunks[0] < balance) {
+      if (selling < balance) {
         logger.info(
-          { mint: position.mint.toBase58(), balance: balance.toString(), chunk: chunks[0].toString(), chunks: chunks.length },
-          'Splitting the sell. One SellV3 of the full balance overflows the program u64 multiply.',
+          {
+            mint: position.mint.toBase58(),
+            balance: balance.toString(),
+            selling: selling.toString(),
+            realSol: live.realQuoteReserves.toString(),
+          },
+          'Selling the most the curve can pay in one SellV3. The rest stays until the curve holds more SOL.',
         );
       }
-      let virtualToken = live.virtualTokenReserves;
-      let virtualQuote = live.virtualQuoteReserves;
-      const sells = chunks.map((chunk) => {
-        const quoted = quoteBondingCurveSell(chunk, virtualToken, virtualQuote, protocolFeeBps, creatorFeeBps);
-        const gross = virtualToken + chunk > 0n ? (chunk * virtualQuote) / (virtualToken + chunk) : 0n;
-        virtualToken += chunk;
-        virtualQuote = virtualQuote > gross ? virtualQuote - gross : 0n;
-        return pumpSellIx({
-          user: this.config.wallet.publicKey,
-          mint: position.mint,
-          baseTokenProgram: position.baseTokenProgram,
-          amount: chunk,
-          minQuoteOut: applySlippage(quoted, slippage),
-          buybackFeeRecipient: recipient,
-        });
-      });
-      const covered = chunks.reduce((sum, chunk) => sum + chunk, 0n);
+      const quoted = quoteBondingCurveSell(
+        selling,
+        live.virtualTokenReserves,
+        live.virtualQuoteReserves,
+        protocolFeeBps,
+        creatorFeeBps,
+      );
       return {
-        instructions: sells,
-        covered,
-        close: covered >= balance,
+        instructions: [
+          pumpSellIx({
+            user: this.config.wallet.publicKey,
+            mint: position.mint,
+            baseTokenProgram: position.baseTokenProgram,
+            amount: selling,
+            minQuoteOut: applySlippage(quoted, slippage),
+            buybackFeeRecipient: recipient,
+          }),
+        ],
+        covered: selling,
+        close: selling >= balance,
       };
     });
     if (cleared === 'migrated') {
@@ -662,6 +669,7 @@ export class PumpTrader {
           minQuoteOut: applySlippage(quoted, slippage),
           buybackQuoteAta: buybackAta,
         }),
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
       ];
       return { instructions: sells, covered: balance, close: true };
     });
@@ -718,6 +726,7 @@ export class PumpTrader {
           minBaseOut: applySlippage(quoted, slippage),
           buybackQuoteAta: buybackAta,
         }),
+        closeBaseAtaIx(NATIVE_MINT, this.config.wallet.publicKey, TOKEN_PROGRAM_ID),
       ];
       return { instructions: sells, covered: balance, close: true };
     });
@@ -1015,16 +1024,6 @@ export class PumpTrader {
       return BigInt(balance.value.amount);
     } catch {
       return 0n;
-    }
-  }
-
-  private async wrapDeficit(required: bigint): Promise<bigint> {
-    try {
-      const ata = getAssociatedTokenAddressSync(NATIVE_MINT, this.config.wallet.publicKey, false, TOKEN_PROGRAM_ID);
-      const account = await getAccount(this.connection, ata, this.connection.commitment);
-      return account.amount >= required ? 0n : required - account.amount;
-    } catch {
-      return required;
     }
   }
 

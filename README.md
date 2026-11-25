@@ -25,7 +25,7 @@ Still present, and intentional:
 1. Install Node.js 18 or newer.
 2. `npm install`
 3. Copy `.env.example` to `.env` and set `PRIVATE_KEY`.
-4. Wrap SOL to WSOL if Raydium is enabled (`QUOTE_MINT=WSOL`). pump.fun bonding-curve buys spend native SOL. PumpSwap wraps SOL inside the buy transaction.
+4. Wrap SOL inside a PumpSwap or Raydium transaction and close the wrapped-SOL account in that same transaction. pump.fun bonding-curve trades already spend native SOL. You do not wrap by hand.
 5. `npm run start`
 
 `QUOTE_AMOUNT=0.001` is smaller than the rent for a token account (about 0.00203928 SOL), so that size cannot be profitable. The example uses 0.05 SOL.

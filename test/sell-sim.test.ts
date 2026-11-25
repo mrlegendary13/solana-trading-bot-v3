@@ -13,7 +13,7 @@ import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID } from '@solana/sp
 import { pumpSellIx } from '../pump/instructions';
 import { decodeBondingCurve, decodePumpGlobal } from '../pump/layout';
 import { bondingCurvePda, pumpGlobalPda } from '../pump/pda';
-import { maxSafeSellAmount } from '../pump/quotes';
+import { maxPayableSellAmount } from '../pump/quotes';
 
 const MINT = new PublicKey('EoaCJHj79AMqrPcnj2WE7QEwgNX9fdVqgJfrSsGzpump');
 const HOLDER = new PublicKey('AwPg35FZmgcdqj4tuz7y445zS96WFeVm1X5y9GXi4JpY');
@@ -51,19 +51,21 @@ async function main() {
   const curveInfo = await connection.getAccountInfo(bondingCurvePda(MINT));
   const curve = curveInfo ? decodeBondingCurve(Buffer.from(curveInfo.data)) : null;
   assert.ok(curve && curve.complete === false);
-  const cap = maxSafeSellAmount(curve.virtualQuoteReserves);
   const globalInfo = await connection.getAccountInfo(pumpGlobalPda());
   const global = globalInfo ? decodePumpGlobal(Buffer.from(globalInfo.data)) : null;
   const recipient = global?.buybackFeeRecipients[0];
   assert.ok(recipient);
+  const payable = maxPayableSellAmount(curve.virtualTokenReserves, curve.virtualQuoteReserves, curve.realQuoteReserves);
   const balance = await connection.getTokenAccountBalance(getAssociatedTokenAddressSync(MINT, HOLDER, false, mintInfo.owner));
   const amount = BigInt(balance.value.amount);
-  assert.ok(amount > cap, 'this holder is large enough to overflow SellV3');
+  assert.strictEqual(amount, 384661258242n);
+  assert.ok(payable < amount);
   const full = await simulate(HOLDER, mintInfo.owner, amount, recipient);
-  assert.deepStrictEqual(full, { InstructionError: [2, { Custom: 6024 }] });
-  const chunk = await simulate(HOLDER, mintInfo.owner, cap, recipient);
-  assert.strictEqual(chunk, null);
-  console.log(`sell simulation passed. full balance overflows, chunk ${cap.toString()} succeeds`);
+  const fullCustom = (full as { InstructionError?: [number, { Custom?: number }] })?.InstructionError?.[1]?.Custom;
+  assert.strictEqual(fullCustom, 6024);
+  const one = await simulate(HOLDER, mintInfo.owner, payable, recipient);
+  assert.strictEqual(one, null);
+  console.log(`sell simulation passed. full balance overflows, one sell of ${payable.toString()} succeeds`);
 }
 
 main().catch((error) => {
